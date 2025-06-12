@@ -265,8 +265,8 @@ if __name__ == "__main__":
         "1. First ask the user to provide their email address.\n"
         "2. Use AuthorizationChecker to check if they are authorized.\n"
         "3. If not authorized, ask them for their details in this format: Name, Email, Clinic, License Number.\n"
-        "4. Use DentistRegistrar to register them.\n"
-        "5. After the user is authorized, say: 'Welcome to 3D-Align. How can I assist you today?'"
+        "4. Use DentistRegistrar to register them only if you have all Name Email Clinic License Number of the user.\n"
+        "5. After the user is authorized dont use DentistRegistrar directly, say: 'Welcome to 3D-Align. How can I assist you today?'"
     )
     auth_memory.chat_memory.add_message(SystemMessage(content=initial_message))
     auth_agent = create_structured_chat_agent(llm=llm, tools=auth_tools, prompt=auth_prompt)
