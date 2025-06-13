@@ -265,7 +265,7 @@ def handle_bot_logic(user_id, message_body, num_media, media_urls):
             ("human", "ask the user to send images for the new case he wants to submit so that we can get quotation talk directly to the user")
         ])
         track_case_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an assistant that tracks case progress."), ("human", "What is the case ID or patient name you would like to track?")
+            ("system", "You are an assistant that tracks case progress."), ("human", "ask for the case Id user wants to track")
         ])
         other_help_prompt = ChatPromptTemplate.from_messages([
             ("system", "You are an assistant helping with general queries."), ("human", "{input}")
