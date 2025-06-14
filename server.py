@@ -1,4 +1,3 @@
-
 # ==============================================================================
 # 1. IMPORTS
 # ==============================================================================
@@ -89,8 +88,10 @@ def initialize_user_session(user_id):
             'last_question': None,
             'image_count': 0,
             'expected_images': 0
+            # No longer need 'location' here as the agent will handle it
         }
 
+# ... (The rest of the helper functions like delete_file_after_delay and forward_media_to_number remain unchanged) ...
 def delete_file_after_delay(file_path, delay=60):
     """Deletes a file after a specified delay in a separate thread."""
     def _delete_file():
@@ -167,22 +168,19 @@ def forward_media_to_number(media_url, sender_whatsapp_id):
         return True
     except requests.exceptions.HTTPError as e:
         print(f"HTTP Error downloading media from Twilio: {e.response.status_code} - {e.response.text}")
-        # Clean up immediately if download failed
         if temp_file_name and os.path.exists(os.path.join(MEDIA_TEMP_DIR, temp_file_name)):
             os.remove(os.path.join(MEDIA_TEMP_DIR, temp_file_name))
         return False
     except Exception as e:
         print(f"Error forwarding media (after download attempt): {e}")
-        # Clean up immediately if error occurred
         if temp_file_name and os.path.exists(os.path.join(MEDIA_TEMP_DIR, temp_file_name)):
             os.remove(os.path.join(MEDIA_TEMP_DIR, temp_file_name))
         return False
-    # No `finally` block here for deletion, as it's handled by `delete_file_after_delay`
+
 
 def handle_bot_logic(user_id, message_body, num_media, media_urls):
     """
     Integrates the bot's logic from mainlogic.py to process a single message.
-    This function will be called for each incoming WhatsApp message.
     """
     session = user_sessions[user_id]
     app_state = session['app_state']
@@ -192,6 +190,7 @@ def handle_bot_logic(user_id, message_body, num_media, media_urls):
     current_stage = session['current_stage']
     last_question = session['last_question']
 
+    # ... (Code for 'auth', 'intent', 'awaiting_images' stages remains the same) ...
     # --- DEBUGGING PRINTS ---
     print(f"\n--- handle_bot_logic for User: {user_id} ---")
     print(f"Incoming message: '{message_body}'")
@@ -293,8 +292,8 @@ Important:
         intent_classification_prompt = ChatPromptTemplate.from_messages([
             ("system", "You are an helpful assistant"),
             ("human", """Your job is to identify if the user has a new case file or patient he would like to submit or he wants to track existing case or patient
-                            Here is the User Input : {input}
-                            Output shoul be one word only : submit_case or track_case or none""")
+                         Here is the User Input : {input}
+                         Output shoul be one word only : submit_case or track_case or none""")
         ])
         submit_case_prompt = ChatPromptTemplate.from_messages([
             ("system", "You are an assistant helping dentists submit new aligner cases."),
@@ -377,9 +376,9 @@ Important:
         confirm_prompt = ChatPromptTemplate.from_messages([
             ("system", "You are an AI assistant"),
             ("human", """User was asked a yes or no question your job is to identify if the user's response was yes or no
-                            this was the question asked {question}
-                            Here is the user's response {input}
-                            output in one word only""")
+                         this was the question asked {question}
+                         Here is the user's response {input}
+                         output in one word only""")
         ])
         confirm_chain = confirm_prompt | llm | output_parser
 
@@ -406,14 +405,15 @@ Important:
             bot_response = "An error occurred while confirming. Please try again."
 
 
+    # MODIFICATION: This stage now transitions directly to the scheduling agent with new instructions.
     elif current_stage == 'scheduling_machine_confirm':
         print("Processing in 'scheduling_machine_confirm' stage...")
         confirm_prompt = ChatPromptTemplate.from_messages([
             ("system", "You are an AI assistant"),
             ("human", """User was asked a yes or no question your job is to identify if the user's response was yes or no
-                            this was the question asked {question}
-                            Here is the user's response {input}
-                            output in one word only""")
+                         this was the question asked {question}
+                         Here is the user's response {input}
+                         output in one word only""")
         ])
         confirm_chain = confirm_prompt | llm | output_parser
         try:
@@ -422,18 +422,28 @@ Important:
             print(f"Machine confirmation response: {machine_response}")
 
             if "Yes" in machine_response or "No" in machine_response:
-                bot_response = "Great! Let's decide appointment time now!!"
+                bot_response = "Great! Let's schedule the appointment." # A simple transition message
                 session['current_stage'] = 'scheduling_appointment'
+                
+                # The new, more detailed prompt for the scheduling agent.
                 sched_initial_message = ("""
-You are a scheduling assistant.
-Ask the user for a time and date they are available for a 30-minute appointment.
-Once the user provides a time and date, convert it to ISO 8601 format (e.g., 2025-06-12T15:30) for the query.
-Use the CheckCalendarAvailability tool to see if it's free.
-If the timeslot is available then display the date and timeslot in nice format and ask for user to confirm the timeslot
-Only when the user confirms the appointment use the BookCalendarAppointment or else ask for new timeslot and repeat the process
+You are a scheduling assistant. Your goal is to book a 3D-Align scanning appointment.
+
+To do this, you absolutely MUST collect two pieces of information from the user before you can book it:
+1. The desired date and time for the appointment.
+2. The full address of the clinic where the appointment will take place.
+
+Follow these steps precisely:
+- First, ask the user for BOTH their preferred date/time AND the full clinic address. Do not proceed until you have both.
+- Once you have a date and time, convert it to an ISO 8601 string (e.g., 2025-06-12T15:30) and use the `CheckCalendarAvailability` tool to see if the slot is free.
+- If the slot is available, confirm the final date, time, AND location with the user one last time.
+- ONLY when the user gives the final confirmation for all details, use the `BookCalendarAppointment` tool. You MUST provide both the 'iso_datetime_str' and the 'location' to this tool.
+- If a slot is not available, inform the user and ask for an alternative time, keeping the location you already collected.
 """)
+                # Clear previous scheduling memory and add the new system prompt
+                sched_memory.clear()
                 sched_memory.chat_memory.add_message(SystemMessage(content=sched_initial_message))
-                print(f"Transitioned to 'scheduling_appointment'. Bot response: {bot_response}")
+                print(f"Transitioned to 'scheduling_appointment' with new instructions.")
             else:
                 bot_response = "I didn't quite catch that. Please let me know if you have scanning machines or if our technicians should bring them."
                 session['last_question'] = "Do you have scanning machines or our technicians should bring them ?"
@@ -441,7 +451,6 @@ Only when the user confirms the appointment use the BookCalendarAppointment or e
         except Exception as e:
             print(f"Error during scheduling_machine_confirm: {e}")
             bot_response = "An error occurred while confirming machine availability. Please try again."
-
 
     elif current_stage == 'scheduling_appointment':
         print("Processing in 'scheduling_appointment' stage...")
@@ -451,22 +460,24 @@ Only when the user confirms the appointment use the BookCalendarAppointment or e
             agent=sched_agent, tools=scheduling_tools, memory=sched_memory, handle_parsing_errors=True, verbose=True
         )
 
-        sched_memory.chat_memory.add_message(HumanMessage(content=message_body))
+        # The first message to this agent will be from the user, following the bot's "Great! Let's schedule..." message
+        # The agent will then use its instructions (in sched_initial_message) to ask for time and location.
         try:
             response = sched_executor.invoke({"input": message_body})
             bot_response = response["output"]
             print(f"Scheduling agent raw response: {response}")
             print(f"Scheduling stage bot_response: {bot_response}")
-            sched_memory.chat_memory.add_message(AIMessage(content=bot_response))
         except Exception as e:
             print(f"Error during scheduling agent invocation: {e}")
             bot_response = "An error occurred during scheduling. Please try again."
 
         if app_state['exi']:
-            bot_response += "\nYour appointment has been successfully booked. Thank you!"
+            # The success message from the tool is already comprehensive
+            # bot_response += "\nYour appointment has been successfully booked. Thank you!"
             session['current_stage'] = 'end_session'
             print(f"Transitioned to 'end_session'. Bot response: {bot_response}")
 
+    # ... (The rest of the stages and the Flask routes remain the same) ...
     # --- Tracking Case Stage ---
     elif current_stage == 'tracking_case':
         print("Processing in 'tracking_case' stage...")
@@ -491,7 +502,6 @@ Only when the user confirms the appointment use the BookCalendarAppointment or e
 # ==============================================================================
 # 4. FLASK ROUTES
 # ==============================================================================
-# New route to serve temporary media files
 @app.route('/media/<filename>')
 def serve_media(filename):
     """Serve media files from the temporary directory."""
@@ -519,13 +529,10 @@ def whatsapp_webhook():
     bot_response = handle_bot_logic(sender_id, incoming_msg, num_media, media_urls)
 
     resp = MessagingResponse()
-    # Ensure bot_response is not None or empty, otherwise Twilio might not send a message
     if bot_response:
         msg = resp.message(bot_response)
     else:
         print("WARNING: bot_response was empty or None. Not sending a message.")
-        # Optionally, send a default error message if bot_response is empty
-        # msg = resp.message("Sorry, I encountered an issue and couldn't respond.")
 
     return str(resp)
 
@@ -545,13 +552,10 @@ if __name__ == "__main__":
         print("Google Calendar service ready.")
 
     print("Starting Flask server. Your Twilio webhook URL will be something like: YOUR_NGROK_URL/whatsapp")
-    # For local testing, ensure NGROK_URL is set in your .env or manually assigned here.
-    # e.g., os.environ['NGROK_URL'] = "YOUR_CURRENT_NGROK_HTTPS_URL"
-    # Make sure to run ngrok: `ngrok http 5000` and copy the HTTPS forwarding URL.
     if not os.getenv("NGROK_URL"):
         print("\n*** IMPORTANT: NGROK_URL environment variable is NOT set. ***")
-        print("    Media forwarding will likely FAIL as Twilio cannot access localhost.")
-        print("    Please run ngrok (e.g., `ngrok http 5000`) and set NGROK_URL in your .env file")
-        print("    to the HTTPS URL ngrok provides (e.g., https://xxxxxxxxxxxx.ngrok-free.app).\n")
+        print("   Media forwarding will likely FAIL as Twilio cannot access localhost.")
+        print("   Please run ngrok (e.g., `ngrok http 5000`) and set NGROK_URL in your .env file")
+        print("   to the HTTPS URL ngrok provides (e.g., https://xxxxxxxxxxxx.ngrok-free.app).\n")
 
     app.run(debug=True, port=5000)
