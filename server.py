@@ -36,21 +36,24 @@ from mainlogic import (
 # ==============================================================================
 # 2. CONFIGURATION AND INITIALIZATION
 # ==============================================================================
-load_dotenv()
+load_dotenv() # This line should be at the very top of your configuration section
 
 app = Flask(__name__)
+load_dotenv()
 
+# Add these lines temporarily for debugging
+print(f"Loaded TWILIO_ACCOUNT_SID: {os.getenv('TWILIO_ACCOUNT_SID')}")
+print(f"Loaded TWILIO_AUTH_TOKEN: {os.getenv('TWILIO_AUTH_TOKEN')}")
+print(f"Loaded NGROK_URL: {os.getenv('NGROK_URL')}")
+# ... rest of your code ...
 # --- Twilio Configuration ---
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
 FORWARD_TO_WHATSAPP_NUMBER = os.getenv("FORWARD_TO_WHATSAPP_NUMBER")
-
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # --- Temporary storage for media files ---
-# We need a predictable temporary directory for Flask to serve from.
-# Ensure this directory exists and is managed.
 MEDIA_TEMP_DIR = os.path.join(tempfile.gettempdir(), "twilio_media_bot")
 os.makedirs(MEDIA_TEMP_DIR, exist_ok=True)
 print(f"Temporary media directory: {MEDIA_TEMP_DIR}")
@@ -59,7 +62,7 @@ print(f"Temporary media directory: {MEDIA_TEMP_DIR}")
 # --- LLM Initialization (from mainlogic.py) ---
 llm = ChatOpenAI(
     model_name="meta-llama/Llama-3.3-70B-Instruct-Turbo",
-    openai_api_key="9b96c1fae180a84b48553e073c97a2a73d2e894740df5d6a8c5ccb6969cb6b82",
+    openai_api_key=os.getenv("TOGETHER_API_KEY"), # Assuming your .env has TOGETHER_API_KEY
     openai_api_base="https://api.together.xyz/v1",
 )
 model = llm
