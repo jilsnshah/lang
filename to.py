@@ -258,7 +258,7 @@ Important:
             ("system", "You are an helpful assistant"),
             ("human", """Your job is to identify if the user has a new case file or patient he would like to submit or he wants to track existing case or patient
                          Here is the User Input : {input}
-                         Output shoul be one word only : submit_case or track_case or none""")
+                         Output should be one word only : submit_case or track_case or none""")
         ])
         submit_case_prompt = ChatPromptTemplate.from_messages([
             ("system", "You are an assistant helping dentists submit new aligner cases."),
@@ -268,7 +268,7 @@ Important:
             ("system", "You are an assistant that tracks case progress."), ("human", "ask for the case Id user wants to track")
         ])
         other_help_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an assistant helping with general queries."), ("human", "{input}")
+            ("human", "{input}")
         ])
 
         intent_chain = intent_classification_prompt | model | output_parser
