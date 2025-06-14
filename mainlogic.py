@@ -40,16 +40,16 @@ SCOPES = ['https://www.googleapis.com/auth/calendar']
 
 # --- LLM Initialization ---
 llm = ChatOpenAI(
-    model_name="meta-llama/Llama-3.3-70B-Instruct-Turbo",
-    openai_api_key=os.getenv("TOGETHER_API_KEY"), # Changed to use environment variable
-    openai_api_base="https://api.together.xyz/v1",
+    model_name="deepseek/deepseek-r1-0528-qwen3-8b:free",
+    openai_api_key=os.getenv("OPENROUTER_API_KEY"), # Assuming your .env has TOGETHER_API_KEY
+    openai_api_base="https://openrouter.ai/api/v1",
 )
 model = llm # Using 'model' as an alias for consistency with the original code.
 
 # --- Mock Dentist Database ---
 # Changed keys to phone numbers
 authorized_dentists = {
-    "+917801833884": { # Example phone number (ensure it's in E.164 format, e.g., +CCXXXXXXXXXX)
+    "+917387829331": { # Example phone number (ensure it's in E.164 format, e.g., +CCXXXXXXXXXX)
         "name": "Dr. Jils Shah",
         "clinic": "Smile Dental Studio",
         "license": "GJ12345"
@@ -148,8 +148,6 @@ def create_tools(calendar_service, app_state):
 
             created_event = calendar_service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
             print(f"Event created: {created_event.get('htmlLink')}")
-
-            app_state['exi'] = True  # Exit loop after booking
             return f"✅ Success! The appointment has been booked for {start_time.strftime('%A, %B %d at %I:%M %p')} at {location_for_calendar}."
 
         except ValueError:
@@ -193,7 +191,6 @@ def create_tools(calendar_service, app_state):
 
     def confirm_appointment_and_exit(*args, **kwargs):
         """Sets the exit flag when an appointment is confirmed."""
-        app_state['exi'] = True
 
     def check_authorization(phone_number: str) -> str:
         """Checks authorization of a dentist using their phone number.
@@ -203,7 +200,6 @@ def create_tools(calendar_service, app_state):
         print(f"Checking authorization for phone number: {cleaned_phone_number}") # Debugging
 
         if cleaned_phone_number in authorized_dentists:
-            app_state['state'] = "registered"
             return f"{authorized_dentists[cleaned_phone_number]['name']} is already authorized."
         else:
             return {
@@ -229,7 +225,6 @@ def create_tools(calendar_service, app_state):
                 "clinic": clinic,
                 "license": license_number
             }
-            app_state['state'] = "registered"
             return f"{name} has been successfully registered you should simply greet them now."
         except Exception as e:
             return f"Invalid format. Please use: Name, Phone Number, Clinic, License Number. Error: {e}"

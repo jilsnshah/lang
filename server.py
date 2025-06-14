@@ -35,14 +35,14 @@ from mainlogic import (
     RunnableLambda,
     RunnableMap,
 )
-
+output_parser = StrOutputParser()
 # ==============================================================================
 # 2. CONFIGURATION AND INITIALIZATION
 # ==============================================================================
 load_dotenv() # This line should be at the very top of your configuration section
 
 app = Flask(__name__)
-load_dotenv()
+
 
 # Add these lines temporarily for debugging
 print(f"Loaded TWILIO_ACCOUNT_SID: {os.getenv('TWILIO_ACCOUNT_SID')}")
@@ -64,9 +64,9 @@ print(f"Temporary media directory: {MEDIA_TEMP_DIR}")
 
 # --- LLM Initialization (from mainlogic.py) ---
 llm = ChatOpenAI(
-    model_name="meta-llama/Llama-3.3-70B-Instruct-Turbo",
-    openai_api_key=os.getenv("TOGETHER_API_KEY"), # Assuming your .env has TOGETHER_API_KEY
-    openai_api_base="https://api.together.xyz/v1",
+    model_name="deepseek/deepseek-r1-0528:free",
+    openai_api_key=os.getenv("OPENROUTER_API_KEY"), # Assuming your .env has TOGETHER_API_KEY
+    openai_api_base="https://openrouter.ai/api/v1",
 )
 model = llm
 
@@ -78,13 +78,10 @@ user_sessions = {}
 # ==============================================================================
 def initialize_user_session(user_id):
     """Initializes the session state for a new user."""
+
     if user_id not in user_sessions:
         user_sessions[user_id] = {
-            'app_state': {
-                'state': None,
-                'cap': "none",
-                'exi': False
-            },
+            'app_state': None,
             'calendar_service': get_calendar_service_oauth(),
             'auth_memory': ConversationBufferMemory(memory_key="chat_history", return_messages=True),
             'sched_memory': ConversationBufferMemory(memory_key="chat_history", return_messages=True),
@@ -186,6 +183,7 @@ def handle_bot_logic(user_id, message_body, num_media, media_urls,session = user
     """
     Integrates the bot's logic from mainlogic.py to process a single message.
     """
+    global output_parser
     session = user_sessions[user_id]
     confirm_prompt = ChatPromptTemplate.from_messages([
             ("system", "You are an AI assistant"),
@@ -195,12 +193,6 @@ def handle_bot_logic(user_id, message_body, num_media, media_urls,session = user
                          output in one word only""")
         ])
     confirm_chain = confirm_prompt | llm | output_parser
-    session['app_state']
-    session['calendar_service']
-    session['auth_memory']
-    session['sched_memory']
-    session['current_stage']
-    session['last_question']
 
     # ... (Code for 'auth', 'intent', 'awaiting_images' stages remains the same) ...
     # --- DEBUGGING PRINTS ---
@@ -209,7 +201,6 @@ def handle_bot_logic(user_id, message_body, num_media, media_urls,session = user
     print(f"Current stage: {session['current_stage']}")
     print(f"Num media: {num_media}, Media URLs: {media_urls}")
     print(f"App state before processing: {session['app_state']}")
-
 
     bot_response = "I'm sorry, I couldn't process your request." # Default response
 
@@ -255,8 +246,7 @@ Instructions:
   "Registration successful. Welcome to 3D-Align. How can I assist you today?"
 
 Important:
-- Never call DentistRegistrar again after successful registration.
-- Do not repeat tool calls or ask the same question twice.
+- Never call DentistRegistrar if you dont have complete information of user.
 - Review chat history before asking anything.
 
 '''
@@ -305,8 +295,6 @@ Important:
         intent_chain = intent_classification_prompt | model | output_parser
         try:
             session['app_state'] = intent_chain.invoke({"input": message_body})
-            print(f"Intent chain raw response: {response}")
-            print(f"Intent stage bot_response: {bot_response}")
         except Exception as e:
             print(f"Error during intent chain invocation: {e}")
             return "An error occurred while determining your intent. Please try again."
@@ -348,9 +336,10 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
             if session['image_count'] > 0:
                 bot_response = f"Thank you for submitting { session['image_count'] } image(s). We will review them and get back to you with a quotation shortly"
                 session['current_stage'] = 'awaiting_quote'
-                session['current_stage'] = 'scheduling_quote_confirm'
                 session['image_count'] = 0 # Reset image count
                 caseid = str(uuid.uuid4())
+                session[caseid] ={}
+                session['active'] = caseid
                 session[caseid]['quote'] = "..." 
                 print(f"Transitioned to 'scheduling_quote_confirm'. Bot response: {bot_response}")
             else:
@@ -361,8 +350,8 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
              print(f"Bot response: {bot_response}")
 
     elif session["current_stage"] == 'awaiting_quote':
-        bot_response = f"Based on the images you provided, the quotation is {session[caseid]["quote"]}, please let us know once the patient agrees to it?"
-        session['current_stage'] == 'scheduling_quote_confirm'
+        bot_response = f"Based on the images you provided, the quotation is {3}, please let us know once the patient agrees to it?"
+        session['current_stage'] = 'scheduling_quote_confirm'
         session['last_question'] = bot_response
 
     # --- Scheduling Stage (after "submit_case" intent and images received) ---
@@ -372,13 +361,14 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
         try:
             confirmation_response = confirm_chain.invoke({"input": message_body, "question": session['last_question']})
             session['last_question'] = None
+            confirmation_response = confirmation_response.lower()
             print(f"Confirmation response: {confirmation_response}")
 
-            if "No" in confirmation_response:
+            if "no" in confirmation_response:
                 bot_response = "Thank you for contacting 3D-Align."
                 session['current_stage'] = 'end_session'
                 print(f"Transitioned to 'end_session'. Bot response: {bot_response}")
-            elif "Yes" in confirmation_response:
+            elif "yes" in confirmation_response:
                 bot_response = "Great...Now would you prefer we bring our own scanning equipment, or do you have it on-site?"
                 session['current_stage'] = 'scheduling_machine_confirm'
                 session['last_question'] = "Do you have scanning machines or our technicians should bring them ?"
@@ -398,9 +388,10 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
             machine_response = confirm_chain.invoke({"input": message_body, "question": session['last_question']})
             session['last_question'] = None
             print(f"Machine confirmation response: {machine_response}")
+            machine_response =machine_response.lower().strip()
 
-            if "Yes" in machine_response or "No" in machine_response:
-                session[caseid]['machine'] = machine_response
+            if "yes" in machine_response or "no" in machine_response:
+                session[session['active']]['machine'] = machine_response
                 bot_response = "Great! Let's schedule the appointment." # A simple transition message
                 session['current_stage'] = 'scheduling_appointment'
                 
