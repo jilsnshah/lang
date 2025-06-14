@@ -35,26 +35,26 @@ load_dotenv()
 # --- Configuration Constants ---
 CLIENT_SECRET_FILE = 'client_secret.json'
 TOKEN_FILE = 'token.json'
-CALENDAR_ID = 'jilsnshah@gmail.com'
+CALENDAR_ID = 'jilsnshah@gmail.com' # Replace with your actual calendar ID
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
 # --- LLM Initialization ---
-# Note: It is best practice to load keys from environment variables, not hardcode them.
-# Example: openai_api_key=os.getenv("TOGETHER_API_KEY")
 llm = ChatOpenAI(
     model_name="meta-llama/Llama-3.3-70B-Instruct-Turbo",
-    openai_api_key="a18c9313356c6d115edee12b37a77f5ebce4656361077556cb792851963faedf",
+    openai_api_key=os.getenv("TOGETHER_API_KEY"), # Changed to use environment variable
     openai_api_base="https://api.together.xyz/v1",
 )
 model = llm # Using 'model' as an alias for consistency with the original code.
 
 # --- Mock Dentist Database ---
+# Changed keys to phone numbers
 authorized_dentists = {
-    "dr.jils@clinic.com": {
+    "+917801833884": { # Example phone number (ensure it's in E.164 format, e.g., +CCXXXXXXXXXX)
         "name": "Dr. Jils Shah",
         "clinic": "Smile Dental Studio",
         "license": "GJ12345"
     }
+    # Add more dentists as needed
 }
 
 # ==============================================================================
@@ -142,6 +142,7 @@ def create_tools(calendar_service, app_state):
             return f"Failed to book appointment due to a Google API error: {e}"
         except Exception as e:
             return f"An unexpected error occurred while booking the appointment: {e}"
+
     def check_calendar_availability(iso_datetime_str: str) -> str:
         """
         Check if a given time in ISO 8601 format (e.g., 2025-06-11T15:30) is free.
@@ -178,40 +179,63 @@ def create_tools(calendar_service, app_state):
         """Sets the exit flag when an appointment is confirmed."""
         app_state['exi'] = True
 
-    def check_authorization(email: str) -> str:
-        """Checks authorization and updates state."""
-        if email.strip().lower() in authorized_dentists:
+    # MODIFIED: check_authorization to use phone number
+    def check_authorization(phone_number: str) -> str:
+        """Checks authorization of a dentist using their phone number.
+        The phone number should be in E.164 format (e.g., '+919876543210').
+        """
+        # Clean the phone number (remove "whatsapp:" prefix if present from Twilio)
+        cleaned_phone_number = phone_number.replace("whatsapp:", "").strip()
+        print(f"Checking authorization for phone number: {cleaned_phone_number}") # Debugging
+
+        if cleaned_phone_number in authorized_dentists:
             app_state['state'] = "registered"
-            return f"{authorized_dentists[email.strip().lower()]['name']} is already authorized."
+            return f"{authorized_dentists[cleaned_phone_number]['name']} is already authorized."
         else:
+            # When not authorized, return dictionary for structured extraction by LLM
             return {
-                "authorized": False, "reason": "Dentist not found",
-                "required_fields": ["name", "email", "clinic", "license"]
+                "authorized": False,
+                "reason": "Dentist not found",
+                "required_fields": ["name", "phone_number", "clinic", "license"]
             }
 
+    # MODIFIED: register_dentist to use phone number
     def register_dentist(details: str) -> str:
-        """Registers a new dentist and updates state."""
+        """Registers a new dentist and updates state.
+        Input format: Name, Phone Number, Clinic, License Number.
+        """
         try:
-            name, email, clinic, license_number = [x.strip() for x in details.split(",")]
-            authorized_dentists[email.lower()] = {
-                "name": name, "clinic": clinic, "license": license_number
+            name, phone_number, clinic, license_number = [x.strip() for x in details.split(",")]
+            
+            # Clean the phone number for storage (ensure E.164 format)
+            cleaned_phone_number = phone_number.replace("whatsapp:", "").strip()
+            if not cleaned_phone_number.startswith('+'):
+                # Basic attempt to fix format if missing country code for demonstration
+                # In a real app, robust validation/normalization would be needed
+                print(f"Warning: Phone number '{phone_number}' does not start with '+'. Attempting to prepend '+'.")
+                cleaned_phone_number = '+' + cleaned_phone_number
+
+            authorized_dentists[cleaned_phone_number] = {
+                "name": name,
+                "clinic": clinic,
+                "license": license_number
             }
             app_state['state'] = "registered"
-            return f"{name} has been registered and is now authorized."
-        except Exception:
-            return "Invalid format. Please use: Name, Email, Clinic, License Number"
+            return f"{name} has been successfully registered you should simply greet them now."
+        except Exception as e:
+            return f"Invalid format. Please use: Name, Phone Number, Clinic, License Number. Error: {e}"
 
     # --- Tool Instantiation ---
     auth_tools = [
         Tool(
             name="AuthorizationChecker",
             func=check_authorization,
-            description="Check if a dentist is authorized using their email address."
+            description="Check if a dentist is authorized using their phone number. Input should be the phone number in E.164 format (e.g., '+919876543210'). This tool should be used first with the sender's phone number without asking the user."
         ),
         Tool(
             name="DentistRegistrar",
             func=register_dentist,
-            description="Register a new dentist. Input format: Name, Email, Clinic, License Number."
+            description="Register a new dentist. Input format: Name, Phone Number, Clinic, License Number. Use this after AuthorizationChecker confirms the dentist is not found and you have collected all required fields."
         )
     ]
 
@@ -232,15 +256,14 @@ def create_tools(calendar_service, app_state):
 
 
 # ==============================================================================
-# 5. MAIN EXECUTION LOGIC
+# 5. MAIN EXECUTION LOGIC (for local testing)
 # ==============================================================================
 if __name__ == "__main__":
     # --- State Management ---
-    # Using a dictionary for state to avoid global variables
     app_state = {
-        'state': None,  # For authorization status
-        'cap': "none",  # For intent capture
-        'exi': False    # For exiting the scheduling loop
+        'state': None, # For authorization status
+        'cap': "none", # For intent capture
+        'exi': False # For exiting the scheduling loop
     }
 
     # --- Initializations ---
@@ -255,25 +278,39 @@ if __name__ == "__main__":
     # --- STAGE 1: AUTHORIZATION ---
     print("--- Starting Authorization Stage ---")
     auth_prompt = hub.pull("hwchase17/structured-chat-agent") + '''Important:
-- If the AuthorizationChecker tool says the user is NOT authorized,
-  do NOT call the same tool again.
-- Instead, collect missing information: name, email, clinic, and license number.
-- Then use the RegisterDentist tool with that data.'''
+- Your first task is to use the AuthorizationChecker tool with the phone number provided in the input (e.g., '+91xxxxxxxxxx'). Do NOT ask the user for their phone number directly if it's already provided.
+- If AuthorizationChecker reports that the user is NOT authorized,
+  then ask them for their full details in this format: Name, Phone Number, Clinic, License Number.
+- Use DentistRegistrar to register them only if you have all Name, Phone Number, Clinic, and License Number of the user.
+- After the user is authorized, say: 'Welcome to 3D-Align. How can I assist you today?'
+'''
     auth_memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-    initial_message = (
-        "You are an AI assistant that helps general dentists get authorized to submit aligner cases.\n"
-        "1. First ask the user to provide their email address.\n"
-        "2. Use AuthorizationChecker to check if they are authorized.\n"
-        "3. If not authorized, ask them for their details in this format: Name, Email, Clinic, License Number.\n"
-        "4. Use DentistRegistrar to register them only if you have all Name Email Clinic License Number of the user.\n"
-        "5. After the user is authorized dont use DentistRegistrar directly, say: 'Welcome to 3D-Align. How can I assist you today?'"
-    )
-    auth_memory.chat_memory.add_message(SystemMessage(content=initial_message))
+    # The initial message is now implicitly handled by the agent's first action
+    # when it receives the phone number as input.
+    # auth_memory.chat_memory.add_message(SystemMessage(content=initial_message))
+    
     auth_agent = create_structured_chat_agent(llm=llm, tools=auth_tools, prompt=auth_prompt)
     auth_executor = AgentExecutor.from_agent_and_tools(
         agent=auth_agent, tools=auth_tools, verbose=True, memory=auth_memory, handle_parsing_errors=True
     )
 
+    # For local testing, simulate the initial WhatsApp sender ID
+    # Replace with a test phone number (should be in E.164 format)
+    test_sender_phone = "+919876543210" # This number is already authorized in the mock db
+    # test_sender_phone = "+919999988888" # This number is NOT authorized
+
+    # Simulate the first message including the sender's phone number
+    # The agent's prompt guides it to use this immediately with AuthorizationChecker
+    initial_auth_input = f"My phone number is {test_sender_phone}. Hello!"
+    print(f"Simulating initial input: {initial_auth_input}")
+
+    # Process the initial input to kick off authentication
+    auth_memory.chat_memory.add_message(HumanMessage(content=initial_auth_input))
+    response = auth_executor.invoke({"input": initial_auth_input})
+    print("Bot:", response["output"])
+    auth_memory.chat_memory.add_message(AIMessage(content=response["output"]))
+    
+    # If not registered, continue the loop for registration details
     while app_state['state'] != 'registered':
         user_input = input("User: ")
         if user_input.lower() == "exit":
@@ -286,7 +323,7 @@ if __name__ == "__main__":
     # --- STAGE 2: INTENT DETECTION ---
     if app_state['state'] == 'registered':
         print("\n--- Starting Intent Detection Stage ---")
-        print("Bot: Welcome to 3D-Align. How can I assist you today?")
+        print("Bot: Welcome to 3D-Align. How can I assist you today?") # Reiterate welcome after successful auth
 
         def capture_intent(x):
             app_state['cap'] = x
@@ -300,10 +337,10 @@ if __name__ == "__main__":
         ])
         submit_case_prompt = ChatPromptTemplate.from_messages([
             ("system", "You are an assistant helping dentists submit new aligner cases."),
-            ("human", "Ask the User to submit images of the case so that we can provide further details and quotation of it, ask in just 1 or 2 sentences")
+            ("human", "ask the user to send images for the new case he wants to submit so that we can get quotation talk directly to the user")
         ])
         track_case_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an assistant that tracks case progress."), ("human", "")
+            ("system", "You are an assistant that tracks case progress."), ("human", "ask for the case Id user wants to track")
         ])
         other_help_prompt = ChatPromptTemplate.from_messages([
             ("system", "You are an assistant helping with general queries."), ("human", "{input}")
@@ -330,9 +367,9 @@ if __name__ == "__main__":
         confirm_prompt = ChatPromptTemplate.from_messages([
             ("system", "You are an AI assistant"),
             ("human", """User was asked a yes or no question your job is to identify if the user's response was yes or no
-                        this was the question asked {question}
-                        Here is the user's response {input}
-                        output in one word only""")
+                         this was the question asked {question}
+                         Here is the user's response {input}
+                         output in one word only""")
         ])
         confirm_chain = confirm_prompt | llm | output_parser
 
@@ -355,8 +392,7 @@ Ask the user for a time and date they are available for a 30-minute appointment.
 Once the user provides a time and date, convert it to ISO 8601 format (e.g., 2025-06-12T15:30) for the query.
 Use the CheckCalendarAvailability tool to see if it's free.
 If the timeslot is available then display the date and timeslot in nice format and ask for user to confirm the timeslot
-Only when the user confirms the appointment use the BookCalendarAppointment or else ask for confirmation
-If user rejects the timeslot ask for new timeslot and repeat the process
+Only when the user confirms the appointment use the BookCalendarAppointment or else ask for new timeslot and repeat the process
 """)
             sched_memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
             sched_memory.chat_memory.add_message(SystemMessage(content=sched_initial_message))

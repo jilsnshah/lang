@@ -1,3 +1,4 @@
+
 # ==============================================================================
 # 1. IMPORTS
 # ==============================================================================
@@ -40,10 +41,10 @@ load_dotenv()
 app = Flask(__name__)
 
 # --- Twilio Configuration ---
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
-FORWARD_TO_WHATSAPP_NUMBER = os.getenv("FORWARD_TO_WHATSAPP_NUMBER")
+TWILIO_ACCOUNT_SID = "AC2a329d4884df5907f55dc0aa99369963"
+TWILIO_AUTH_TOKEN = "9a6c354035bee6cac6177559a137fce7"
+TWILIO_WHATSAPP_NUMBER = "whatsapp:+14155238886"
+FORWARD_TO_WHATSAPP_NUMBER = "whatsapp:+917801833884"
 
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
@@ -58,7 +59,7 @@ print(f"Temporary media directory: {MEDIA_TEMP_DIR}")
 # --- LLM Initialization (from mainlogic.py) ---
 llm = ChatOpenAI(
     model_name="meta-llama/Llama-3.3-70B-Instruct-Turbo",
-    openai_api_key=os.getenv("TOGETHER_API_KEY"),
+    openai_api_key="9b96c1fae180a84b48553e073c97a2a73d2e894740df5d6a8c5ccb6969cb6b82",
     openai_api_base="https://api.together.xyz/v1",
 )
 model = llm
@@ -86,15 +87,6 @@ def initialize_user_session(user_id):
             'image_count': 0,
             'expected_images': 0
         }
-        initial_auth_message = (
-            "You are an AI assistant that helps general dentists get authorized to submit aligner cases.\n"
-            "1. First ask the user to provide their email address.\n"
-            "2. Use AuthorizationChecker to check if they are authorized.\n"
-            "3. If not authorized, ask them for their details in this format: Name, Email, Clinic, License Number.\n"
-            "4. Use DentistRegistrar to register them only if you have all Name Email Clinic License Number of the user.\n"
-            "5. After the user is authorized dont use DentistRegistrar directly, say: 'Welcome to 3D-Align. How can I assist you today?'"
-        )
-        user_sessions[user_id]['auth_memory'].chat_memory.add_message(SystemMessage(content=initial_auth_message))
 
 def delete_file_after_delay(file_path, delay=60):
     """Deletes a file after a specified delay in a separate thread."""
@@ -217,34 +209,75 @@ def handle_bot_logic(user_id, message_body, num_media, media_urls):
     # --- Authorization Stage ---
     if current_stage == 'auth':
         print("Processing in 'auth' stage...")
-        auth_prompt = hub.pull("hwchase17/structured-chat-agent") + '''Important:
-- If the AuthorizationChecker tool says the user is NOT authorized,
-  do NOT call the same tool again.
-- Instead, collect missing information: name, email, clinic, and license number.
-- Then use the DentistRegistrar tool with that data.'''
 
-        auth_agent = create_structured_chat_agent(llm=llm, tools=auth_tools, prompt=auth_prompt)
-        auth_executor = AgentExecutor.from_agent_and_tools(
-            agent=auth_agent, tools=auth_tools, verbose=True, memory=auth_memory, handle_parsing_errors=True
-        )
+        # Clean phone number from Twilio format
+        pure_sender_phone = user_id.replace("whatsapp:", "").strip()
 
-        auth_memory.chat_memory.add_message(HumanMessage(content=message_body))
-        try:
-            response = auth_executor.invoke({"input": message_body})
-            bot_response = response["output"]
-            print(f"Auth agent raw response: {response}")
-            print(f"Auth bot_response: {bot_response}")
-            auth_memory.chat_memory.add_message(AIMessage(content=bot_response))
-        except Exception as e:
-            print(f"Error during auth agent invocation: {e}")
-            bot_response = "An error occurred during authorization. Please try again."
+        # Manually check authorization
+        auth_result = auth_tools[0](user_id)
 
-        if app_state['state'] == 'registered':
+        if isinstance(auth_result, str) and "authorized" in auth_result.lower():
+            # Already authorized: move to next stage
             session['current_stage'] = 'intent'
             bot_response = "Welcome to 3D-Align. How can I assist you today?"
-            auth_memory.clear()
-            print(f"Transitioned to 'intent' stage. Bot response: {bot_response}")
+            print("Authorization confirmed. Transitioning to 'intent' stage.")
 
+        else:
+            # Not authorized: run registration agent
+            print("Dentist not authorized. Invoking registration agent.")
+
+            registration_prompt = hub.pull("hwchase17/structured-chat-agent") + '''
+
+You are an assistant helping register dentists to 3D-Align.
+
+Instructions:
+- The user's phone number is already known. Never ask for it.
+- Collect the following:
+  - Full Name
+  - Clinic Name
+  - License Number
+- After collecting all three, call the DentistRegistrar tool with:
+  "name, phone_number, clinic, license"
+- After successful registration, respond:
+  "Registration successful. Welcome to 3D-Align. How can I assist you today?"
+
+Important:
+- Never call DentistRegistrar again after successful registration.
+- Do not repeat tool calls or ask the same question twice.
+- Review chat history before asking anything.
+
+'''
+
+            # Create agent and executor for registration only
+            auth_agent = create_structured_chat_agent(llm=llm, tools=[auth_tools[1]], prompt=registration_prompt)
+            auth_executor = AgentExecutor.from_agent_and_tools(
+                agent=auth_agent, tools=auth_tools, verbose=True, memory=auth_memory, handle_parsing_errors=True
+            )
+
+            # Prepare input message
+            input_to_agent = message_body
+            if not auth_memory.chat_memory.messages or (
+                len(auth_memory.chat_memory.messages) == 1 and isinstance(auth_memory.chat_memory.messages[0], SystemMessage)
+            ):
+                input_to_agent = f"User's phone number: {pure_sender_phone}. User says: {message_body}"
+                print(f"First registration input crafted: {input_to_agent}")
+
+            auth_memory.chat_memory.add_message(HumanMessage(content=input_to_agent))
+
+            try:
+                response = auth_executor.invoke({"input": input_to_agent})
+                bot_response = response["output"]
+                print(f"Registration agent response: {bot_response}")
+
+                if "Registration successful" in bot_response:
+                    session['current_stage'] = 'intent'
+                    auth_memory.clear()
+                    app_state['state'] = 'registered'
+                    print("Dentist registered. Transitioning to 'intent' stage.")
+
+            except Exception as e:
+                print(f"Error during registration agent execution: {e}")
+                bot_response = "An error occurred during registration. Please try again."
 
     # --- Intent Detection Stage ---
     elif current_stage == 'intent':
