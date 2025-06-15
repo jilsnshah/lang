@@ -64,7 +64,7 @@ print(f"Temporary media directory: {MEDIA_TEMP_DIR}")
 
 # --- LLM Initialization (from mainlogic.py) ---
 llm = ChatOpenAI(
-    model_name="deepseek/deepseek-r1-0528:free",
+    model_name="qwen/qwen3-32b:free",
     openai_api_key=os.getenv("OPENROUTER_API_KEY"), # Assuming your .env has TOGETHER_API_KEY
     openai_api_base="https://openrouter.ai/api/v1",
 )
@@ -482,7 +482,6 @@ Rules:
 - Never assume anything—always wait for clear user input.
 - Never suggest alternate times yourself.
 - Only the user decides what to book.
-
 """
         sched_agent = create_structured_chat_agent(llm, tools=scheduling_tools, prompt=sched_prompt)
         sched_executor = AgentExecutor.from_agent_and_tools(
