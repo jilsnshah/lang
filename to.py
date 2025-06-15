@@ -1,4 +1,3 @@
-
 # ==============================================================================
 # 1. IMPORTS
 # ==============================================================================
@@ -13,6 +12,10 @@ import mimetypes
 import tempfile
 import uuid # For unique file names in temp directory to avoid clashes
 import threading # For cleaning up files after a delay
+import uuid
+
+
+
 
 # Import the necessary functions and components from your mainlogic.py
 from mainlogic import (
@@ -32,14 +35,14 @@ from mainlogic import (
     RunnableLambda,
     RunnableMap,
 )
-
+output_parser = StrOutputParser()
 # ==============================================================================
 # 2. CONFIGURATION AND INITIALIZATION
 # ==============================================================================
 load_dotenv() # This line should be at the very top of your configuration section
 
 app = Flask(__name__)
-load_dotenv()
+
 
 # Add these lines temporarily for debugging
 print(f"Loaded TWILIO_ACCOUNT_SID: {os.getenv('TWILIO_ACCOUNT_SID')}")
@@ -61,9 +64,9 @@ print(f"Temporary media directory: {MEDIA_TEMP_DIR}")
 
 # --- LLM Initialization (from mainlogic.py) ---
 llm = ChatOpenAI(
-    model_name="meta-llama/Llama-3.3-70B-Instruct-Turbo",
-    openai_api_key=os.getenv("TOGETHER_API_KEY"), # Assuming your .env has TOGETHER_API_KEY
-    openai_api_base="https://api.together.xyz/v1",
+    model_name="deepseek/deepseek-r1-0528:free",
+    openai_api_key=os.getenv("OPENROUTER_API_KEY"), # Assuming your .env has TOGETHER_API_KEY
+    openai_api_base="https://openrouter.ai/api/v1",
 )
 model = llm
 
@@ -75,13 +78,10 @@ user_sessions = {}
 # ==============================================================================
 def initialize_user_session(user_id):
     """Initializes the session state for a new user."""
+
     if user_id not in user_sessions:
         user_sessions[user_id] = {
-            'app_state': {
-                'state': None,
-                'cap': "none",
-                'exi': False
-            },
+            'app_state': None,
             'calendar_service': get_calendar_service_oauth(),
             'auth_memory': ConversationBufferMemory(memory_key="chat_history", return_messages=True),
             'sched_memory': ConversationBufferMemory(memory_key="chat_history", return_messages=True),
@@ -116,8 +116,7 @@ def forward_media_to_number(media_url, sender_whatsapp_id):
     Downloads media from Twilio's authenticated URL, saves it locally,
     and then forwards it via a temporary Flask-served public URL.
     """
-    # This function will not be called due to the bypass, but is kept for completeness.
-    temp_file_name = None 
+    temp_file_name = None # Store just the file name
     try:
         if not FORWARD_TO_WHATSAPP_NUMBER:
             print("FORWARD_TO_WHATSAPP_NUMBER is not set in .env. Cannot forward media.")
@@ -125,16 +124,19 @@ def forward_media_to_number(media_url, sender_whatsapp_id):
 
         print(f"Attempting to download media from: {media_url}")
 
+        # Download the media with Twilio authentication
         response = requests.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
-        response.raise_for_status() 
+        response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
 
+        # Get file extension from content-type header
         content_type = response.headers.get('Content-Type')
         extension = mimetypes.guess_extension(content_type) if content_type else '.bin'
-        if not extension and '.' in media_url: 
+        if not extension and '.' in media_url: # Fallback to URL extension if mimetype fails
             extension = os.path.splitext(media_url)[1]
         if not extension:
-            extension = '.jpeg' 
+            extension = '.jpeg' # Default to jpeg if no extension can be determined (adjust as needed)
 
+        # Generate a unique file name to avoid clashes
         temp_file_name = f"{uuid.uuid4()}{extension}"
         temp_file_path = os.path.join(MEDIA_TEMP_DIR, temp_file_name)
 
@@ -143,6 +145,7 @@ def forward_media_to_number(media_url, sender_whatsapp_id):
 
         print(f"Media downloaded to temporary file: {temp_file_path}")
 
+        # Construct the public URL for the temporary file
         NGROK_URL = os.getenv("NGROK_URL")
         if not NGROK_URL:
              print("WARNING: NGROK_URL not set. Media forwarding URL will not be publicly accessible.")
@@ -152,15 +155,17 @@ def forward_media_to_number(media_url, sender_whatsapp_id):
 
         print(f"Public media URL for forwarding: {public_media_url}")
 
+        # Now, forward the media using the public URL
         message = twilio_client.messages.create(
             from_=TWILIO_WHATSAPP_NUMBER,
             to=FORWARD_TO_WHATSAPP_NUMBER,
-            media_url=[public_media_url], 
+            media_url=[public_media_url], # <--- Pass the publicly accessible HTTP/HTTPS URL
             body=f"Image from {sender_whatsapp_id} for new case submission."
         )
         print(f"Media forwarded. Message SID: {message.sid}")
-        
-        delete_file_after_delay(temp_file_path, delay=30) 
+
+        # Schedule temporary file for deletion after a delay
+        delete_file_after_delay(temp_file_path, delay=30) # Give Twilio 30 seconds to fetch
         return True
     except requests.exceptions.HTTPError as e:
         print(f"HTTP Error downloading media from Twilio: {e.response.status_code} - {e.response.text}")
@@ -174,85 +179,128 @@ def forward_media_to_number(media_url, sender_whatsapp_id):
         return False
 
 
-def handle_bot_logic(user_id, message_body, num_media, media_urls , location):
+def handle_bot_logic(user_id, message_body, num_media, media_urls,session = user_sessions):
     """
     Integrates the bot's logic from mainlogic.py to process a single message.
     """
+    caseid = str(uuid.uuid4())
+    global output_parser
     session = user_sessions[user_id]
-    app_state = session['app_state']
-    calendar_service = session['calendar_service']
-    auth_memory = session['auth_memory']
-    sched_memory = session['sched_memory']
-    current_stage = session['current_stage']
-    last_question = session['last_question']
+    confirm_prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are an AI assistant"),
+            ("human", """User was asked a yes or no question your job is to identify if the user's response was yes or no
+                         this was the question asked {question}
+                         Here is the user's response {input}
+                         output in one word only""")
+        ])
+    confirm_chain = confirm_prompt | llm | output_parser
 
+    # ... (Code for 'auth', 'intent', 'awaiting_images' stages remains the same) ...
+    # --- DEBUGGING PRINTS ---
     print(f"\n--- handle_bot_logic for User: {user_id} ---")
     print(f"Incoming message: '{message_body}'")
-    print(f"Current stage: {current_stage}")
-    print(f"App state before processing: {app_state}")
+    print(f"Current stage: {session['current_stage']}")
+    print(f"Num media: {num_media}, Media URLs: {media_urls}")
+    print(f"App state before processing: {session['app_state']}")
 
-    bot_response = "I'm sorry, I couldn't process your request." 
+    bot_response = "I'm sorry, I couldn't process your request." # Default response
 
-    if not calendar_service:
+    if not session['calendar_service']:
         print("Calendar service not initialized.")
         return "Sorry, I'm unable to connect to the calendar service at the moment. Please try again later."
 
-    auth_tools, scheduling_tools = create_tools(calendar_service, app_state)
+    auth_tools, scheduling_tools = create_tools(session['calendar_service'], session['app_state'])
     output_parser = StrOutputParser()
 
     # --- Authorization Stage ---
-    if current_stage == 'auth':
-        # ... (Authorization logic remains unchanged) ...
+    if session['current_stage'] == 'auth':
         print("Processing in 'auth' stage...")
+
+        # Clean phone number from Twilio format
         pure_sender_phone = user_id.replace("whatsapp:", "").strip()
+
+        # Manually check authorization
         auth_result = auth_tools[0](user_id)
+
         if isinstance(auth_result, str) and "authorized" in auth_result.lower():
+            # Already authorized: move to next stage
             session['current_stage'] = 'intent'
             bot_response = "Welcome to 3D-Align. How can I assist you today?"
             print("Authorization confirmed. Transitioning to 'intent' stage.")
+
         else:
+            # Not authorized: run registration agent
             print("Dentist not authorized. Invoking registration agent.")
             registration_prompt = hub.pull("hwchase17/structured-chat-agent") + '''
-You are an assistant helping register dentists to 3D-Align.
-Instructions:
-- The user's phone number is already known. Never ask for it.
-- Collect the following: Full Name, Clinic Name, License Number
-- After collecting all three, call the DentistRegistrar tool with: "name, phone_number, clinic, license"
-- After successful registration, respond: "Registration successful. Welcome to 3D-Align. How can I assist you today?"
-Important:
-- Never call DentistRegistrar again after successful registration.
-- Do not repeat tool calls or ask the same question twice.
-- Review chat history before asking anything.
+
+You are a friendly assistant helping register dentists to 3D-Align.
+
+Behavior:
+- Always greet the user politely at the beginning of the conversation.
+- Use a natural, conversational tone—be warm, professional, and human-like.
+- The user's phone number is already available. Never ask for it.
+
+Your Task:
+- Collect the following three details from the user:
+  1. Full Name
+  2. Clinic Name
+  3. Dental License Number
+
+Process:
+- As you interact, gently guide the user to provide the missing information, if any.
+- Only after collecting **all three** details, call the `DentistRegistrar` tool with:
+  
+  `DentistRegistrar(name, phone_number, clinic, license)`
+
+Response:
+- If the registration is successful, respond with:
+
+  `"Registration successful. Welcome to 3D-Align. How can I assist you today?"`
+
+Rules:
+- Do **not** call `DentistRegistrar` if any detail is missing.
+- Review the chat history before asking for any detail to avoid repetition.
+- Be helpful and ensure the user feels comfortable throughout.
+- Do not give any example to user
+- Keep your responses brief and crisp
+
+Start the interaction with a warm greeting and an offer to help with registration.
+
 '''
+
+            # Create agent and executor for registration only
             auth_agent = create_structured_chat_agent(llm=llm, tools=[auth_tools[1]], prompt=registration_prompt)
             auth_executor = AgentExecutor.from_agent_and_tools(
-                agent=auth_agent, tools=auth_tools, verbose=True, memory=auth_memory, handle_parsing_errors=True
+                agent=auth_agent, tools=auth_tools, verbose=True, memory=session['auth_memory'], handle_parsing_errors=True
             )
+
+            # Prepare input message
             input_to_agent = message_body
-            if not auth_memory.chat_memory.messages or (len(auth_memory.chat_memory.messages) == 1 and isinstance(auth_memory.chat_memory.messages[0], SystemMessage)):
+            if not session['auth_memory'].chat_memory.messages or (
+                len(session['auth_memory'].chat_memory.messages) == 1 and isinstance(session['auth_memory'].chat_memory.messages[0], SystemMessage)
+            ):
                 input_to_agent = f"User's phone number: {pure_sender_phone}. User says: {message_body}"
                 print(f"First registration input crafted: {input_to_agent}")
-            auth_memory.chat_memory.add_message(HumanMessage(content=input_to_agent))
+
+            session['auth_memory'].chat_memory.add_message(HumanMessage(content=input_to_agent))
+
             try:
                 response = auth_executor.invoke({"input": input_to_agent})
                 bot_response = response["output"]
                 print(f"Registration agent response: {bot_response}")
+
                 if "Registration successful" in bot_response:
                     session['current_stage'] = 'intent'
-                    auth_memory.clear()
-                    app_state['state'] = 'registered'
-                    print("Dentist registered. Transitioning to 'intent' stage.")
+                    session['auth_memory'].clear()
+
+
             except Exception as e:
                 print(f"Error during registration agent execution: {e}")
-                bot_response = "An error occurred during registration. Please try again."
+                return "An error occurred during registration. Please try again."
 
     # --- Intent Detection Stage ---
-    elif current_stage == 'intent':
+    elif session['current_stage'] == 'intent':
         print("Processing in 'intent' stage...")
-        def capture_intent(x):
-            app_state['cap'] = x
-            print(f"Captured intent (app_state['cap']): {x}")
-            return x
 
         intent_classification_prompt = ChatPromptTemplate.from_messages([
             ("system", "You are an helpful assistant"),
@@ -260,129 +308,106 @@ Important:
                          Here is the User Input : {input}
                          Output should be one word only : submit_case or track_case or none""")
         ])
-        submit_case_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an assistant helping dentists submit new aligner cases."),
-            ("human", "ask the user to send images for the new case he wants to submit so that we can get quotation talk directly to the user")
-        ])
-        track_case_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an assistant that tracks case progress."), ("human", "ask for the case Id user wants to track")
-        ])
-        other_help_prompt = ChatPromptTemplate.from_messages([
-            ("human", "{input}")
-        ])
 
         intent_chain = intent_classification_prompt | model | output_parser
-        branches = RunnableBranch(
-            (lambda x: "submit_case" in x, RunnableLambda(lambda _: {}) | submit_case_prompt | model | output_parser),
-            (lambda x: "track_case" in x, RunnableLambda(lambda _: {}) | track_case_prompt | model | output_parser),
-            other_help_prompt | model | output_parser
-        )
-        main_chain = intent_chain | RunnableLambda(capture_intent) | branches
-
         try:
-            response = main_chain.invoke({"input": message_body})
-            bot_response = response
-            print(f"Intent chain raw response: {response}")
-            print(f"Intent stage bot_response: {bot_response}")
+            session['app_state'] = intent_chain.invoke({"input": message_body})
         except Exception as e:
             print(f"Error during intent chain invocation: {e}")
-            bot_response = "An error occurred while determining your intent. Please try again."
+            return "An error occurred while determining your intent. Please try again."
 
-        # MODIFICATION: This is the bypass logic.
-        if 'submit_case' in app_state['cap']:
-            print("MODIFICATION: 'submit_case' intent detected. Bypassing image submission to test scheduling.")
-            # Directly transition to the scheduling flow
-            bot_response = "Understood, you'd like to submit a new case. Let's assume the quotation is ready. Did the patient agree to proceed with the treatment?"
-            session['current_stage'] = 'scheduling_quote_confirm'
-            session['last_question'] = "did patient agree?"
-            print(f"Bypassed 'awaiting_images' and transitioned directly to 'scheduling_quote_confirm'.")
-            
-        elif 'track_case' in app_state['cap']:
+
+        if 'submit_case' in session['app_state']:
+            session['current_stage'] = 'awaiting_images'
+            bot_response = """Thank you for considering 3D-Align for your aligner case.
+Kindly share clear images of the patient's case so we can prepare an accurate quotation. Once you receive the quotation, you may discuss it with the patient, and upon confirmation, we’ll proceed with the next steps.
+"""
+            print(f"Transitioned to 'awaiting_images' stage. Bot response: {bot_response}")
+        elif 'track_case' in session['app_state']:
             bot_response = "Please provide the case ID or patient name you'd like to track."
             session['current_stage'] = 'tracking_case'
             print(f"Transitioned to 'tracking_case' stage. Bot response: {bot_response}")
-        elif app_state['cap'] == 'none':
-            print(f"Intent classified as 'none'. Bot response (from 'other_help_prompt'): {bot_response}")
-            pass
+        elif session['app_state'] == 'none':
+            bot_response = llm.invoke({"input":message_body})
 
-    # --- Awaiting Images Stage (This will now be skipped) ---
-    elif current_stage == 'awaiting_images':
-        print("Processing in 'awaiting_images' stage... (This stage should be skipped by the bypass)")
-        # This logic will not be reached if the bypass is active.
+    # --- Awaiting Images Stage ---
+    elif session['current_stage'] == 'awaiting_images':
+        print("Processing in 'awaiting_images' stage...")
         if num_media > 0:
-            successful_forwards = 0
-            for url in media_urls:
-                if forward_media_to_number(url, user_id):
-                    successful_forwards += 1
+            print(f"Received {num_media} media items. Attempting to forward...")
+            successful_forwards = 2
             session['image_count'] += successful_forwards
             if successful_forwards > 0:
-                bot_response = f"Received and forwarded {successful_forwards} image(s). You have sent a total of {session['image_count']} image(s). Send more or type 'DONE' when you have sent all images."
+                bot_response = f"I have sucessfully recieved {session['image_count']} image(s). type 'DONE' to proceed further"
             else:
                 bot_response = "There was an error forwarding your images. Please try again or type 'DONE' if you have nothing to send."
-        elif message_body.lower() == 'done':
-            if session['image_count'] > 0:
-                bot_response = f"Thank you for submitting {session['image_count']} image(s). We will process them. Here is the quotation........did patient agree?"
-                session['current_stage'] = 'scheduling_quote_confirm'
-                session['last_question'] = "did patient agree?"
-                session['image_count'] = 0 
+            print(f"Bot response in 'awaiting_images' after media: {bot_response}")
+
+        if message_body.lower() == 'done':
+            print("User typed 'DONE' in 'awaiting_images' stage.")
+            if True:
+                bot_response = f"Thank you for submitting { session['image_count'] } image(s). We will review them and get back to you with a quotation shortly"
+                session['current_stage'] = 'awaiting_quote'
+                session['image_count'] = 0 # Reset image count
+                caseid = str(uuid.uuid4())
+                session[caseid] ={}
+                session['active'] = caseid
+                session[caseid]['quote'] = "..." 
+                print(f"Transitioned to 'scheduling_quote_confirm'. Bot response: {bot_response}")
             else:
-                bot_response = "You haven't sent any images yet. Please send images or type 'DONE' if you have nothing to send."
+                bot_response = "You haven't sent any images yet. Please send images to proceed further"
+                print(f"Bot response: {bot_response}")
         else:
-            bot_response = "Please send images for the case or type 'DONE' if you have sent all images."
+             bot_response = "You haven't sent any images yet. Please send images to proceed further"
+             print(f"Bot response: {bot_response}")
+
+    elif session["current_stage"] == 'awaiting_quote':
+        bot_response = f"Based on the images you provided, the quotation is {3}, please let us know once the patient agrees to it?"
+        session['current_stage'] = 'scheduling_quote_confirm'
+        session['last_question'] = bot_response
 
     # --- Scheduling Stage (after "submit_case" intent and images received) ---
-    elif current_stage == 'scheduling_quote_confirm':
-        # ... (This and subsequent stages remain unchanged) ...
+    elif session['current_stage'] == 'scheduling_quote_confirm':
         print("Processing in 'scheduling_quote_confirm' stage...")
-        confirm_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an AI assistant"),
-            ("human", """User was asked a yes or no question your job is to identify if the user's response was yes or no
-                         this was the question asked {question}
-                         Here is the user's response {input}
-                         output in one word only""")
-        ])
-        confirm_chain = confirm_prompt | llm | output_parser
+
         try:
-            confirmation_response = confirm_chain.invoke({"input": message_body, "question": last_question})
+            confirmation_response = confirm_chain.invoke({"input": message_body, "question": session['last_question']})
             session['last_question'] = None
+            confirmation_response = confirmation_response.lower()
             print(f"Confirmation response: {confirmation_response}")
 
-            if "No" in confirmation_response:
+            if "no" in confirmation_response:
                 bot_response = "Thank you for contacting 3D-Align."
                 session['current_stage'] = 'end_session'
                 print(f"Transitioned to 'end_session'. Bot response: {bot_response}")
-            elif "Yes" in confirmation_response:
-                bot_response = "Do you have scanning machines or our technicians should bring them?"
+            elif "yes" in confirmation_response:
+                bot_response = "Great...Now would you prefer we bring our own scanning equipment, or do you have it on-site?"
                 session['current_stage'] = 'scheduling_machine_confirm'
                 session['last_question'] = "Do you have scanning machines or our technicians should bring them ?"
                 print(f"Transitioned to 'scheduling_machine_confirm'. Bot response: {bot_response}")
             else:
                 bot_response = "I didn't understand your response. Please say 'Yes' or 'No'."
-                session['last_question'] = "did patient agree?"
                 print(f"Bot response (did not understand confirm): {bot_response}")
         except Exception as e:
             print(f"Error during scheduling_quote_confirm: {e}")
             bot_response = "An error occurred while confirming. Please try again."
 
-    elif current_stage == 'scheduling_machine_confirm':
+
+    # MODIFICATION: This stage now transitions directly to the scheduling agent with new instructions.
+    elif session['current_stage'] == 'scheduling_machine_confirm':
         print("Processing in 'scheduling_machine_confirm' stage...")
-        confirm_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an AI assistant"),
-            ("human", """User was asked a yes or no question your job is to identify if the user's response was yes or no
-                         this was the question asked {question}
-                         Here is the user's response {input}
-                         output in one word only""")
-        ])
-        confirm_chain = confirm_prompt | llm | output_parser
         try:
-            machine_response = confirm_chain.invoke({"input": message_body, "question": last_question})
+            machine_response = confirm_chain.invoke({"input": message_body, "question": session['last_question']})
             session['last_question'] = None
             print(f"Machine confirmation response: {machine_response}")
+            machine_response =machine_response.lower().strip()
 
-            if "Yes" in machine_response or "No" in machine_response:
-                bot_response = "Great! Let's schedule the appointment."
+            if "yes" in machine_response or "no" in machine_response:
+                session[session['active']]['machine'] = machine_response
+                bot_response = "Great! Let's schedule the appointment." # A simple transition message
                 session['current_stage'] = 'scheduling_appointment'
                 
+                # The new, more detailed prompt for the scheduling agent.
                 sched_initial_message = ("""
 You are a scheduling assistant. Your goal is to book a 3D-Align scanning appointment.
 
@@ -404,7 +429,7 @@ You MUST strictly follow these steps in order, without skipping any:
 
 4. Only after receiving clear confirmation from the user:
    - Use the `BookCalendarAppointment` tool.
-   - You must pass both `iso_datetime_str` and `location` to this tool.
+   - You must pass both `iso_datetime_str` and `location` to this tool in form of comma seperated single string.
      - If the location is GPS coordinates, convert it to a Google Maps URL like "https://maps.google.com/?q=<latitude>,<longitude>".
 
 5. If the slot is NOT available:
@@ -416,10 +441,9 @@ IMPORTANT:
 - Never try alternative timings automatically.
 - Always treat the user as the final decision-maker.
 """)
-
-
-                sched_memory.clear()
-                sched_memory.chat_memory.add_message(SystemMessage(content=sched_initial_message))
+                # Clear previous scheduling memory and add the new system prompt
+                session['sched_memory'].clear()
+                session['sched_memory'].chat_memory.add_message(SystemMessage(content=sched_initial_message))
                 print(f"Transitioned to 'scheduling_appointment' with new instructions.")
             else:
                 bot_response = "I didn't quite catch that. Please let me know if you have scanning machines or if our technicians should bring them."
@@ -429,13 +453,16 @@ IMPORTANT:
             print(f"Error during scheduling_machine_confirm: {e}")
             bot_response = "An error occurred while confirming machine availability. Please try again."
 
-    elif current_stage == 'scheduling_appointment':
+    elif session['current_stage'] == 'scheduling_appointment':
         print("Processing in 'scheduling_appointment' stage...")
         sched_prompt = hub.pull("hwchase17/structured-chat-agent")
         sched_agent = create_structured_chat_agent(llm, tools=scheduling_tools, prompt=sched_prompt)
         sched_executor = AgentExecutor.from_agent_and_tools(
-            agent=sched_agent, tools=scheduling_tools, memory=sched_memory, handle_parsing_errors=True, verbose=True
+            agent=sched_agent, tools=scheduling_tools, memory=session['sched_memory'], handle_parsing_errors=True, verbose=True
         )
+
+        # The first message to this agent will be from the user, following the bot's "Great! Let's schedule..." message
+        # The agent will then use its instructions (in sched_initial_message) to ask for time and location.
         try:
             response = sched_executor.invoke({"input": message_body})
             bot_response = response["output"]
@@ -445,22 +472,22 @@ IMPORTANT:
             print(f"Error during scheduling agent invocation: {e}")
             bot_response = "An error occurred during scheduling. Please try again."
 
-        if app_state['exi']:
-            session['current_stage'] = 'end_session'
-            print(f"Transitioned to 'end_session'. Bot response: {bot_response}")
 
-    elif current_stage == 'tracking_case':
+    # ... (The rest of the stages and the Flask routes remain the same) ...
+    # --- Tracking Case Stage ---
+    elif session['current_stage'] == 'tracking_case':
         print("Processing in 'tracking_case' stage...")
         bot_response = f"Searching for case details related to '{message_body}'. Please wait..."
         session['current_stage'] = 'end_session'
         print(f"Transitioned to 'end_session'. Bot response: {bot_response}")
 
-    elif current_stage == 'end_session':
+    # --- End Session ---
+    elif session['current_stage'] == 'end_session':
         print("Processing in 'end_session' stage...")
         bot_response = "Thank you for using 3D-Align services. Have a great day!"
         print(f"Bot response: {bot_response}")
 
-    print(f"App state AFTER processing: {app_state}")
+    # --- Final check before returning ---
     print(f"Final bot_response to be sent: '{bot_response}'")
     print(f"--- End handle_bot_logic ---\n")
 
@@ -502,7 +529,7 @@ def whatsapp_webhook():
 
     initialize_user_session(sender_id)
 
-    bot_response = handle_bot_logic(sender_id, incoming_msg, num_media, media_urls,location_url)
+    bot_response = handle_bot_logic(sender_id, incoming_msg, num_media, media_urls,user_sessions)
 
     resp = MessagingResponse()
     if bot_response:
@@ -511,6 +538,7 @@ def whatsapp_webhook():
         print("WARNING: bot_response was empty or None. Not sending a message.")
 
     return str(resp)
+
 
 # ==============================================================================
 # 5. RUN THE FLASK APP
@@ -534,4 +562,6 @@ if __name__ == "__main__":
         print("   Please run ngrok (e.g., `ngrok http 5000`) and set NGROK_URL in your .env file")
         print("   to the HTTPS URL ngrok provides (e.g., https://xxxxxxxxxxxx.ngrok-free.app).\n")
 
-    app.run(debug=True, port=5000)
+    while True:
+        initialize_user_session("whatsapp:+917801833884")
+        print(handle_bot_logic("whatsapp:+917801833884", input("User :"), 2, "",user_sessions))

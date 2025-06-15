@@ -49,7 +49,7 @@ model = llm # Using 'model' as an alias for consistency with the original code.
 # --- Mock Dentist Database ---
 # Changed keys to phone numbers
 authorized_dentists = {
-    "+917387829331": { # Example phone number (ensure it's in E.164 format, e.g., +CCXXXXXXXXXX)
+    "+917801833884": { # Example phone number (ensure it's in E.164 format, e.g., +CCXXXXXXXXXX)
         "name": "Dr. Jils Shah",
         "clinic": "Smile Dental Studio",
         "license": "GJ12345"
