@@ -74,7 +74,7 @@ model = llm
 
 # --- Global state for each user (for simplicity; ideally use a database) ---
 user_sessions = {}
-
+namebook = {}
 # ==============================================================================
 # 3. HELPER FUNCTIONS FOR BOT LOGIC INTEGRATION
 # ==============================================================================
@@ -188,12 +188,19 @@ def handle_bot_logic(user_id, message_body, num_media, media_urls,session = user
     global output_parser
     session = user_sessions[user_id]
     confirm_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an AI assistant"),
-            ("human", """User was asked a yes or no question your job is to identify if the user's response was yes or no
-                         this was the question asked {question}
-                         Here is the user's response {input}
-                         output in one word only""")
-        ])
+    ("system", "You are an AI assistant that analyzes user responses."),
+    ("human", """
+You are given a yes-or-no question and a user's response.
+
+Task:
+- Determine if the user's response indicates **Yes** or **No**.
+- If the response is unclear or ambiguous, return `Unknown`.
+- Respond with **only one word**: Yes, No, or Unknown.
+
+Question: {question}
+User's Response: {input}
+""")
+])
     confirm_chain = confirm_prompt | llm | output_parser
 
     # ... (Code for 'auth', 'intent', 'awaiting_images' stages remains the same) ...
@@ -409,7 +416,7 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
             if "yes" in machine_response or "no" in machine_response:
                 session[session['active']]['machine'] = machine_response
                 bot_response = "Great! Let's schedule the appointment." # A simple transition message
-                session['current_stage'] = 'scheduling_appointment'
+                session['current_stage'] = 'fetching_name'
                 
                 # The new, more detailed prompt for the scheduling agent.
                 # Clear previous scheduling memory and add the new system prompt
@@ -422,8 +429,30 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
         except Exception as e:
             print(f"Error during scheduling_machine_confirm: {e}")
             bot_response = "An error occurred while confirming machine availability. Please try again."
+    
+    elif session['current_stage'] == 'fetching_name' :
+        print("stage : getname")
+        get_name = llm.invoke(f"""
+You are an AI assistant.
 
-    elif session['current_stage'] == 'scheduling_appointment':
+The user was asked to provide the patient's name. Their response was:
+"{message_body}"
+
+Your task:
+- Extract the patient's **full name** from the response.
+- your response should be **only the name** as plain text, with no extra words or formatting.
+- If a name cannot be confidently identified, return a message that starts with the backtick symbol (`) and politely ask the user to provide the full name again.
+""").content
+
+        print(get_name)
+        if '`' in get_name :
+            bot_response = get_name
+        else :
+            #session[session['active']]['name'] = get_name
+            #namebook[session['active']] = get_name
+            message_body = "Hi"
+            session['current_stage'] = 'scheduling_appointment'
+    if session['current_stage'] == 'scheduling_appointment':
         print("Processing in 'scheduling_appointment' stage...")
         sched_prompt = hub.pull("hwchase17/structured-chat-agent")+"""
 You are a friendly and helpful assistant responsible for scheduling 3D-Align scanning appointments.

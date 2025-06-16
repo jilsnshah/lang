@@ -64,7 +64,7 @@ print(f"Temporary media directory: {MEDIA_TEMP_DIR}")
 
 # --- LLM Initialization (from mainlogic.py) ---
 llm = ChatOpenAI(
-    model_name="qwen/qwen3-32b:free",
+    model_name="deepseek/deepseek-r1-0528:free",
     openai_api_key=os.getenv("OPENROUTER_API_KEY"), # Assuming your .env has TOGETHER_API_KEY
     openai_api_base="https://openrouter.ai/api/v1",
 )
@@ -328,7 +328,7 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
             session['current_stage'] = 'tracking_case'
             print(f"Transitioned to 'tracking_case' stage. Bot response: {bot_response}")
         elif session['app_state'] == 'none':
-            bot_response = llm.invoke({"input":message_body})
+            bot_response = llm.invoke(message_body).content
 
     # --- Awaiting Images Stage ---
     elif session['current_stage'] == 'awaiting_images':
@@ -404,8 +404,8 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
 
             if "yes" in machine_response or "no" in machine_response:
                 session[session['active']]['machine'] = machine_response
-                bot_response = "Great! Let's schedule the appointment." # A simple transition message
-                session['current_stage'] = 'scheduling_appointment'
+                bot_response = "Great! Let's schedule the appointment...Please let me know the name of the patient." # A simple transition message
+                session['current_stage'] = 'fetching_name'
                 
                 # The new, more detailed prompt for the scheduling agent.
                 
@@ -419,8 +419,27 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
         except Exception as e:
             print(f"Error during scheduling_machine_confirm: {e}")
             bot_response = "An error occurred while confirming machine availability. Please try again."
+    elif session['current_stage'] == 'fetching_name' :
+        print("stage : getname")
+        get_name = llm.invoke(f"""
+You are an AI assistant.
 
-    elif session['current_stage'] == 'scheduling_appointment':
+The user was asked to provide the patient's name. Their response was:
+"{message_body}"
+
+Your task:
+- Extract the patient's **full name** from the response.
+- your response should be **only the name** as plain text, with no extra words or formatting.
+- If a name cannot be confidently identified, return a message that starts with the backtick symbol (`) and politely ask the user to provide the full name again.
+""").content
+
+        print(get_name)
+        if '`' in get_name :
+            bot_response = get_name
+        else :
+            session[session['active']]['name'] = get_name
+            session['current_stage'] = 'scheduling_appointment'
+    if session['current_stage'] == 'scheduling_appointment':
         print("Processing in 'scheduling_appointment' stage...")
         sched_prompt = hub.pull("hwchase17/structured-chat-agent")+"""
 You are a friendly and helpful assistant responsible for scheduling 3D-Align scanning appointments.
