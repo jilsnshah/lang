@@ -54,6 +54,11 @@ authorized_dentists = {
         "clinic": "Smile Dental Studio",
         "license": "GJ12345"
     },
+    "+917801833884": { # Example phone number (ensure it's in E.164 format, e.g., +CCXXXXXXXXXX)
+        "name": "Dr. Jils Shah",
+        "clinic": "Smile Dental Studio",
+        "license": "GJ12345"
+    },
     "+919898864413": { # Example phone number (ensure it's in E.164 format, e.g., +CCXXXXXXXXXX)
         "name": "Dr. Jils Shah",
         "clinic": "Smile Dental Studio",
@@ -104,6 +109,38 @@ def get_calendar_service_oauth():
     except Exception as e:
         print(f"An unexpected error occurred during service initialization: {e}")
         return None
+from langchain.schema import BaseMessage
+
+def ls(memory_obj):
+    """
+    Converts a LangChain ConversationBufferMemory object to a list of serializable message dicts.
+    """
+    serializable_messages = []
+    for msg in memory_obj.chat_memory.messages:
+        # It's good practice to ensure msg is a BaseMessage type before accessing .type and .content
+        if hasattr(msg, 'type') and hasattr(msg, 'content'):
+            serializable_messages.append({
+                "type": msg.type,      # "human", "ai", etc.
+                "content": msg.content # Message text
+            })
+    return serializable_messages
+
+def sl(serializable_messages_list):
+    """
+    Converts a list of serializable message dicts back into a LangChain ConversationBufferMemory object.
+    """
+    memory_obj = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+    for msg_dict in serializable_messages_list:
+        msg_type = msg_dict.get("type")
+        msg_content = msg_dict.get("content")
+        if msg_type == "human":
+            memory_obj.chat_memory.add_message(HumanMessage(content=msg_content))
+        elif msg_type == "ai":
+            memory_obj.chat_memory.add_message(AIMessage(content=msg_content))
+        elif msg_type == "system": # Add if you also store SystemMessages in memory
+            memory_obj.chat_memory.add_message(SystemMessage(content=msg_content))
+        # Add other message types if you store them (e.g., FunctionMessage)
+    return memory_obj
 
 # ==============================================================================
 # 4. TOOL DEFINITIONS

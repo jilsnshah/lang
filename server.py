@@ -13,8 +13,33 @@ import tempfile
 import uuid # For unique file names in temp directory to avoid clashes
 import threading # For cleaning up files after a delay
 import uuid
+import os
+import firebase_admin
+from firebase_admin import db # Import the Realtime Database service
+from firebase_admin import credentials # Generally not needed if using ADC, but good to know
+import sys
+import time
+from datetime import datetime
 
+FIREBASE_DATABASE_URL = "https://diesel-ellipse-463111-a5-default-rtdb.asia-southeast1.firebasedatabase.app/"
+firebase_app = None # To hold the initialized Firebase app instance
+try:
+    # Initialize Firebase Admin SDK using Application Default Credentials.
+    # Specify the databaseURL to connect to your Realtime Database instance.
+    firebase_app = firebase_admin.initialize_app(
+        options={'databaseURL': FIREBASE_DATABASE_URL}
+    )
+    print(f"Firebase app initialized successfully for Realtime Database: '{FIREBASE_DATABASE_URL}'.")
+except Exception as e:
+    print(f"ERROR: Could not initialize Firebase Admin SDK or connect to Realtime Database.")
+    print(f"Please ensure you have replaced 'YOUR_REALTIME_DATABASE_URL_HERE' with your actual URL,")
+    print(f"and that ADC are configured and billing is enabled for your project.")
+    print(f"Error details: {e}")
+    sys.exit(1) # Exit if initialization fails, as the app can't function
 
+# Get a reference to the root of the database
+# All operations start from this reference
+root_ref = db.reference('/')
 
 
 # Import the necessary functions and components from your mainlogic.py
@@ -34,6 +59,8 @@ from mainlogic import (
     RunnableBranch,
     RunnableLambda,
     RunnableMap,
+    ls,
+    sl
 )
 output_parser = StrOutputParser()
 # ==============================================================================
@@ -60,6 +87,7 @@ twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 MEDIA_TEMP_DIR = os.path.join(tempfile.gettempdir(), "twilio_media_bot")
 os.makedirs(MEDIA_TEMP_DIR, exist_ok=True)
 print(f"Temporary media directory: {MEDIA_TEMP_DIR}")
+user_sessions_fb = root_ref.child('user_sessions')
 
 
 # --- LLM Initialization (from mainlogic.py) ---
@@ -73,26 +101,26 @@ model = llm
 
 
 # --- Global state for each user (for simplicity; ideally use a database) ---
-user_sessions = {}
 namebook = {}
 # ==============================================================================
 # 3. HELPER FUNCTIONS FOR BOT LOGIC INTEGRATION
 # ==============================================================================
+def update_db(user_id,session) :
+    user_sessions_fb.child(user_id).set(session)
+
+print("hehe",ls(ConversationBufferMemory(memory_key="chat_history", return_messages=True)))
 def initialize_user_session(user_id):
     """Initializes the session state for a new user."""
-
-    if user_id not in user_sessions:
-        user_sessions[user_id] = {
-            'app_state': None,
-            'calendar_service': get_calendar_service_oauth(),
-            'auth_memory': ConversationBufferMemory(memory_key="chat_history", return_messages=True),
-            'sched_memory': ConversationBufferMemory(memory_key="chat_history", return_messages=True),
+    user_sessions_fb.child(user_id).set({
+            'app_state': "",
+            'auth_memory' : False,
+            'sched_memory' : False,
+            'calendar_service': True,
             'current_stage': 'auth',
-            'last_question': None,
+            'last_question': "",
             'image_count': 0,
             'expected_images': 0
-            # No longer need 'location' here as the agent will handle it
-        }
+        })
 
 # ... (The rest of the helper functions like delete_file_after_delay and forward_media_to_number remain unchanged) ...
 def delete_file_after_delay(file_path, delay=60):
@@ -181,12 +209,21 @@ def forward_media_to_number(media_url, sender_whatsapp_id):
         return False
 
 
-def handle_bot_logic(user_id, message_body, num_media, media_urls,session = user_sessions):
+def handle_bot_logic(user_id, message_body, num_media, media_urls,session):
+    if session['auth_memory'] :
+        print("here auth")
+        session['auth_memory'] = sl(session['auth_memory'])
+    else :
+        session['auth_memory'] = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+    if session['sched_memory'] :
+        session['sched_memory'] = sl(session['auth_memory'])
+    else :
+        session['sched_memory'] = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+    
     """
     Integrates the bot's logic from mainlogic.py to process a single message.
     """
     global output_parser
-    session = user_sessions[user_id]
     confirm_prompt = ChatPromptTemplate.from_messages([
     ("system", "You are an AI assistant that analyzes user responses."),
     ("human", """
@@ -288,8 +325,7 @@ Start the interaction with a warm greeting and an offer to help with registratio
             ):
                 input_to_agent = f"User's phone number: {pure_sender_phone}. User says: {message_body}"
                 print(f"First registration input crafted: {input_to_agent}")
-
-            session['auth_memory'].chat_memory.add_message(HumanMessage(content=input_to_agent))
+                session['auth_memory'].chat_memory.add_message(HumanMessage(content=input_to_agent))
 
             try:
                 response = auth_executor.invoke({"input": input_to_agent})
@@ -356,7 +392,7 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
 
         elif message_body.lower() == 'done':
             print("User typed 'DONE' in 'awaiting_images' stage.")
-            if session['image_count'] > 0:
+            if session['image_count'] > 0 or manual_test:
                 bot_response = f"Thank you for submitting { session['image_count'] } image(s). We will review them and get back to you with a quotation shortly"
                 session['current_stage'] = 'awaiting_quote'
                 session['image_count'] = 0 # Reset image count
@@ -415,7 +451,7 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
 
             if "yes" in machine_response or "no" in machine_response:
                 session[session['active']]['machine'] = machine_response
-                bot_response = "Great! Let's schedule the appointment." # A simple transition message
+                bot_response = "Great! Let's schedule the appointment....Please provide me the full name of patient" # A simple transition message
                 session['current_stage'] = 'fetching_name'
                 
                 # The new, more detailed prompt for the scheduling agent.
@@ -550,6 +586,16 @@ Rules:
     # --- Final check before returning ---
     print(f"Final bot_response to be sent: '{bot_response}'")
     print(f"--- End handle_bot_logic ---\n")
+    if ls(session['sched_memory']) :
+        session['sched_memory'] = ls(session['sched_memory'])
+    else:
+        session['sched_memory'] = False
+    if ls(session['auth_memory']) :
+        session['auth_memory'] = ls(session['auth_memory'])
+    else:
+        session['auth_memory']= False
+    session['calender_service'] = True
+    update_db(user_id,session)
 
     return bot_response
 
@@ -589,9 +635,12 @@ def whatsapp_webhook():
             media_urls.append(media_url)
             print(f"Received media URL: {media_url}")
 
-    initialize_user_session(sender_id)
-
-    bot_response = handle_bot_logic(sender_id, incoming_msg, num_media, media_urls, user_sessions)
+    
+    session = user_sessions_fb.child(sender_id).get()
+    if session is not None :
+        bot_response = handle_bot_logic(sender_id, incoming_msg, num_media, media_urls, session)
+    else :
+        initialize_user_session(sender_id)
 
     resp = MessagingResponse()
     if bot_response:
@@ -633,5 +682,18 @@ if __name__ == "__main__":
         print("   Media forwarding will likely FAIL as Twilio cannot access localhost.")
         print("   Please run ngrok (e.g., `ngrok http 5000`) and set NGROK_URL in your .env file")
         print("   to the HTTPS URL ngrok provides (e.g., https://xxxxxxxxxxxx.ngrok-free.app).\n")
-
+    manual_test = True
+    while manual_test:
+        sender_id = "whatsapp:+917801833899"
+        num_media = 0
+        media_urls =[]
+        session = user_sessions_fb.child(sender_id).get()
+        if session is not None :
+            incoming_msg = input("user :")
+            print(session)
+            session = dict(session)
+            session['calender_service'] = get_calendar_service_oauth()
+            bot_response = handle_bot_logic(sender_id, incoming_msg, num_media, media_urls, session)
+        else :
+            initialize_user_session(sender_id)
     app.run(debug=True, port=5000)

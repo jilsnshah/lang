@@ -13,8 +13,33 @@ import tempfile
 import uuid # For unique file names in temp directory to avoid clashes
 import threading # For cleaning up files after a delay
 import uuid
+import os
+import firebase_admin
+from firebase_admin import db # Import the Realtime Database service
+from firebase_admin import credentials # Generally not needed if using ADC, but good to know
+import sys
+import time
+from datetime import datetime
 
+FIREBASE_DATABASE_URL = "https://diesel-ellipse-463111-a5-default-rtdb.asia-southeast1.firebasedatabase.app/"
+firebase_app = None # To hold the initialized Firebase app instance
+try:
+    # Initialize Firebase Admin SDK using Application Default Credentials.
+    # Specify the databaseURL to connect to your Realtime Database instance.
+    firebase_app = firebase_admin.initialize_app(
+        options={'databaseURL': FIREBASE_DATABASE_URL}
+    )
+    print(f"Firebase app initialized successfully for Realtime Database: '{FIREBASE_DATABASE_URL}'.")
+except Exception as e:
+    print(f"ERROR: Could not initialize Firebase Admin SDK or connect to Realtime Database.")
+    print(f"Please ensure you have replaced 'YOUR_REALTIME_DATABASE_URL_HERE' with your actual URL,")
+    print(f"and that ADC are configured and billing is enabled for your project.")
+    print(f"Error details: {e}")
+    sys.exit(1) # Exit if initialization fails, as the app can't function
 
+# Get a reference to the root of the database
+# All operations start from this reference
+root_ref = db.reference('/')
 
 
 # Import the necessary functions and components from your mainlogic.py
@@ -60,6 +85,7 @@ twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 MEDIA_TEMP_DIR = os.path.join(tempfile.gettempdir(), "twilio_media_bot")
 os.makedirs(MEDIA_TEMP_DIR, exist_ok=True)
 print(f"Temporary media directory: {MEDIA_TEMP_DIR}")
+user_sessions_fb = root_ref.child('user_sessions')
 
 
 # --- LLM Initialization (from mainlogic.py) ---
@@ -70,17 +96,21 @@ llm = ChatOpenAI(
 )
 model = llm
 
+
+
 # --- Global state for each user (for simplicity; ideally use a database) ---
 user_sessions = {}
-
+namebook = {}
 # ==============================================================================
 # 3. HELPER FUNCTIONS FOR BOT LOGIC INTEGRATION
 # ==============================================================================
+def update_db(user_id,session) :
+    user_sessions_fb.child(user_id).set(session)
+
+
 def initialize_user_session(user_id):
     """Initializes the session state for a new user."""
-
-    if user_id not in user_sessions:
-        user_sessions[user_id] = {
+    user_sessions_fb.child(user_id).set({
             'app_state': None,
             'calendar_service': get_calendar_service_oauth(),
             'auth_memory': ConversationBufferMemory(memory_key="chat_history", return_messages=True),
@@ -90,7 +120,7 @@ def initialize_user_session(user_id):
             'image_count': 0,
             'expected_images': 0
             # No longer need 'location' here as the agent will handle it
-        }
+        })
 
 # ... (The rest of the helper functions like delete_file_after_delay and forward_media_to_number remain unchanged) ...
 def delete_file_after_delay(file_path, delay=60):
@@ -179,20 +209,25 @@ def forward_media_to_number(media_url, sender_whatsapp_id):
         return False
 
 
-def handle_bot_logic(user_id, message_body, num_media, media_urls,session = user_sessions):
+def handle_bot_logic(user_id, message_body, num_media, media_urls,session):
     """
     Integrates the bot's logic from mainlogic.py to process a single message.
     """
-    caseid = str(uuid.uuid4())
     global output_parser
-    session = user_sessions[user_id]
     confirm_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an AI assistant"),
-            ("human", """User was asked a yes or no question your job is to identify if the user's response was yes or no
-                         this was the question asked {question}
-                         Here is the user's response {input}
-                         output in one word only""")
-        ])
+    ("system", "You are an AI assistant that analyzes user responses."),
+    ("human", """
+You are given a yes-or-no question and a user's response.
+
+Task:
+- Determine if the user's response indicates **Yes** or **No**.
+- If the response is unclear or ambiguous, return `Unknown`.
+- Respond with **only one word**: Yes, No, or Unknown.
+
+Question: {question}
+User's Response: {input}
+""")
+])
     confirm_chain = confirm_prompt | llm | output_parser
 
     # ... (Code for 'auth', 'intent', 'awaiting_images' stages remains the same) ...
@@ -265,7 +300,6 @@ Rules:
 - Keep your responses brief and crisp
 
 Start the interaction with a warm greeting and an offer to help with registration.
-
 '''
 
             # Create agent and executor for registration only
@@ -292,7 +326,6 @@ Start the interaction with a warm greeting and an offer to help with registratio
                 if "Registration successful" in bot_response:
                     session['current_stage'] = 'intent'
                     session['auth_memory'].clear()
-
 
             except Exception as e:
                 print(f"Error during registration agent execution: {e}")
@@ -328,14 +361,19 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
             session['current_stage'] = 'tracking_case'
             print(f"Transitioned to 'tracking_case' stage. Bot response: {bot_response}")
         elif session['app_state'] == 'none':
-            bot_response = llm.invoke(message_body).content
+            bot_response = llm.invoke({"input":message_body})
 
     # --- Awaiting Images Stage ---
     elif session['current_stage'] == 'awaiting_images':
         print("Processing in 'awaiting_images' stage...")
         if num_media > 0:
             print(f"Received {num_media} media items. Attempting to forward...")
-            successful_forwards = 2
+            successful_forwards = 0
+            for url in media_urls:
+                if forward_media_to_number(url, user_id):
+                    successful_forwards += 1
+                else:
+                    print(f"Failed to forward media: {url}")
             session['image_count'] += successful_forwards
             if successful_forwards > 0:
                 bot_response = f"I have sucessfully recieved {session['image_count']} image(s). type 'DONE' to proceed further"
@@ -343,9 +381,9 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
                 bot_response = "There was an error forwarding your images. Please try again or type 'DONE' if you have nothing to send."
             print(f"Bot response in 'awaiting_images' after media: {bot_response}")
 
-        if message_body.lower() == 'done':
+        elif message_body.lower() == 'done':
             print("User typed 'DONE' in 'awaiting_images' stage.")
-            if True:
+            if session['image_count'] > 0 or manual_test:
                 bot_response = f"Thank you for submitting { session['image_count'] } image(s). We will review them and get back to you with a quotation shortly"
                 session['current_stage'] = 'awaiting_quote'
                 session['image_count'] = 0 # Reset image count
@@ -404,11 +442,10 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
 
             if "yes" in machine_response or "no" in machine_response:
                 session[session['active']]['machine'] = machine_response
-                bot_response = "Great! Let's schedule the appointment...Please let me know the name of the patient." # A simple transition message
+                bot_response = "Great! Let's schedule the appointment....Please provide me the full name of patient" # A simple transition message
                 session['current_stage'] = 'fetching_name'
                 
                 # The new, more detailed prompt for the scheduling agent.
-                
                 # Clear previous scheduling memory and add the new system prompt
                 session['sched_memory'].clear()
                 print(f"Transitioned to 'scheduling_appointment' with new instructions.")
@@ -419,6 +456,7 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
         except Exception as e:
             print(f"Error during scheduling_machine_confirm: {e}")
             bot_response = "An error occurred while confirming machine availability. Please try again."
+    
     elif session['current_stage'] == 'fetching_name' :
         print("stage : getname")
         get_name = llm.invoke(f"""
@@ -437,7 +475,9 @@ Your task:
         if '`' in get_name :
             bot_response = get_name
         else :
-            session[session['active']]['name'] = get_name
+            #session[session['active']]['name'] = get_name
+            #namebook[session['active']] = get_name
+            message_body = "Hi"
             session['current_stage'] = 'scheduling_appointment'
     if session['current_stage'] == 'scheduling_appointment':
         print("Processing in 'scheduling_appointment' stage...")
@@ -476,8 +516,6 @@ If the slot is available:
 - Say: “The slot is available.”
 - Then ask: “Would you like me to book the appointment for this date, time, and location?”
 
-→ Do **not** proceed without a clear confirmation like “yes” or “please book it”.
-
 ---
 
 **Step 4 - Book Appointment:**
@@ -487,6 +525,7 @@ If the user confirms:
 
   - If the location is GPS coordinates, convert it to:
     `https://maps.google.com/?q=<latitude>,<longitude>`
+  - After successfully booking appointment say thank you and ask if they need anything else politely
 
 ---
 
@@ -501,6 +540,8 @@ Rules:
 - Never assume anything—always wait for clear user input.
 - Never suggest alternate times yourself.
 - Only the user decides what to book.
+- Keep you response brief
+
 """
         sched_agent = create_structured_chat_agent(llm, tools=scheduling_tools, prompt=sched_prompt)
         sched_executor = AgentExecutor.from_agent_and_tools(
@@ -536,6 +577,7 @@ Rules:
     # --- Final check before returning ---
     print(f"Final bot_response to be sent: '{bot_response}'")
     print(f"--- End handle_bot_logic ---\n")
+    update_db(user_id,session)
 
     return bot_response
 
@@ -566,24 +608,39 @@ def whatsapp_webhook():
         print("User location received:", location_url)
         incoming_msg = location_url
     media_urls = []
-    location_url =[]
+    # Remove the redundant `location_url =[]` line as it's not used and can cause confusion.
+    # media_urls should be sufficient.
+
     if num_media > 0:
         for i in range(num_media):
             media_url = request.values.get(f"MediaUrl{i}")
             media_urls.append(media_url)
             print(f"Received media URL: {media_url}")
 
-    initialize_user_session(sender_id)
-
-    bot_response = handle_bot_logic(sender_id, incoming_msg, num_media, media_urls,user_sessions)
+    
+    session = user_sessions_fb.child(sender_id).get()
+    if session is not None :
+        bot_response = handle_bot_logic(sender_id, incoming_msg, num_media, media_urls, session)
+    else :
+        initialize_user_session(sender_id)
 
     resp = MessagingResponse()
     if bot_response:
-        msg = resp.message(bot_response)
+         message = twilio_client.messages.create(
+                from_=TWILIO_WHATSAPP_NUMBER,
+                to=sender_id,
+                body=bot_response
+            )
     else:
-        print("WARNING: bot_response was empty or None. Not sending a message.")
+        print("WARNING: bot_response was empty or None. Sending a generic message.")
+        # Ensure a message is always added to the response, even if bot_response is empty
+        msg = resp.message("Sorry, I'm having trouble generating a response right now. Please try again.")
 
-    return str(resp)
+    # IMPORTANT: REMOVE these print statements! They interfere with the HTTP response.
+    # print(resp) 
+    # print(msg) 
+    
+    return str(resp) # This is the ONLY line that should send the TwiML to Twilio
 
 
 # ==============================================================================
@@ -607,7 +664,17 @@ if __name__ == "__main__":
         print("   Media forwarding will likely FAIL as Twilio cannot access localhost.")
         print("   Please run ngrok (e.g., `ngrok http 5000`) and set NGROK_URL in your .env file")
         print("   to the HTTPS URL ngrok provides (e.g., https://xxxxxxxxxxxx.ngrok-free.app).\n")
-
-    while True:
-        initialize_user_session("whatsapp:+917801833884")
-        print(handle_bot_logic("whatsapp:+917801833884", input("User :"), 2, "",user_sessions))
+    manual_test = True
+    if manual_test:
+        sender_id = "whatsapp:+917801833884"
+        incoming_msg = input("user :")
+        num_media = 0
+        media_urls =[]
+        while True :
+            session = user_sessions_fb.child(sender_id).get()
+            if session is not None :
+                bot_response = handle_bot_logic(sender_id, incoming_msg, num_media, media_urls, session)
+            else :
+                initialize_user_session(sender_id)
+    else :
+        app.run(debug=True, port=5000)
