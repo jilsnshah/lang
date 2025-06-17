@@ -1,205 +1,146 @@
 import os
-import firebase_admin
-from firebase_admin import db # Import the Realtime Database service
-from firebase_admin import credentials # Generally not needed if using ADC, but good to know
-import sys
-import time
-from datetime import datetime
+import pickle
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
 
 # --- Configuration ---
-# Ensure your Google Cloud Project has billing enabled and
-# you have set up Application Default Credentials (ADC) for your environment.
-# For local development: run 'gcloud auth application-default login' in your terminal.
-# For GCP deployments: ensure a service account with Realtime Database permissions is attached.
+# Path to your client_secret.json file (the one you already have for Calendar API)
+CLIENT_SECRET_FILE = 'client_secret.json' 
+# Path to store/load user's authentication tokens (this file will be updated/overwritten)
+TOKEN_FILE = 'token.json' 
 
-# --- IMPORTANT: Replace with YOUR Realtime Database URL ---
-# You can find this URL in your Firebase Console under Realtime Database.
-# It will look something like: "https://YOUR-PROJECT-ID-default-rtdb.firebaseio.com/"
-FIREBASE_DATABASE_URL = "https://diesel-ellipse-463111-a5-default-rtdb.asia-southeast1.firebasedatabase.app/" # <--- REPLACE THIS!
+# IMPORTANT: Include ALL scopes your application needs.
+# This will trigger a new consent screen asking the user to approve both Calendar and Drive access.
+SCOPES = [
+    'https://www.googleapis.com/auth/drive',        # For Google Drive access
+    'https://www.googleapis.com/auth/calendar'      # For Google Calendar access (if you still need it)
+    # Add other Calendar scopes if you use more specific ones, e.g., 'https://www.googleapis.com/auth/calendar.events'
+] 
 
-# --- User Identification for this CLI app ---
-# Data will be stored under a path like: messages/cli_test_user_123/{message_id}
-CLI_USER_ID = "cli-rtdb-test-user-123" # A static ID for CLI testing
+# ID of the shared folder in amalthea@iitgn.ac.in's Google Drive.
+# IMPORTANT: The account that authenticates via OAuth must have 'Editor' access to this folder.
+SHARED_FOLDER_ID = '1o24t5XaFt4CG8ZZp1a108eF9OXJtHr-v' 
 
-# --- Firebase Initialization ---
-firebase_app = None # To hold the initialized Firebase app instance
-try:
-    # Initialize Firebase Admin SDK using Application Default Credentials.
-    # Specify the databaseURL to connect to your Realtime Database instance.
-    firebase_app = firebase_admin.initialize_app(
-        options={'databaseURL': FIREBASE_DATABASE_URL}
-    )
-    print(f"Firebase app initialized successfully for Realtime Database: '{FIREBASE_DATABASE_URL}'.")
-except Exception as e:
-    print(f"ERROR: Could not initialize Firebase Admin SDK or connect to Realtime Database.")
-    print(f"Please ensure you have replaced 'YOUR_REALTIME_DATABASE_URL_HERE' with your actual URL,")
-    print(f"and that ADC are configured and billing is enabled for your project.")
-    print(f"Error details: {e}")
-    sys.exit(1) # Exit if initialization fails, as the app can't function
+# Path to the file you want to upload from your local system
+LOCAL_FILE_PATH = 'requirements.txt'
+# Desired name for the file in Google Drive
+FILE_NAME_IN_DRIVE = 'hello.txt' 
 
-# Get a reference to the root of the database
-# All operations start from this reference
-root_ref = db.reference('/')
+# --- Authentication and Service Initialization ---
+def authenticate_user_oauth():
+    """Authenticates a user via OAuth 2.0 and returns a Drive service object."""
+    creds = None
+    # The file token.json stores the user's access and refresh tokens.
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE, 'rb') as token:
+            creds = pickle.load(token)
 
-# --- Realtime Database Operations ---
-
-def add_message(message_text):
-    """
-    Adds a new message document to the user's messages path.
-
-    Realtime Database Syntax:
-    - `db.reference(path)`: Gets a reference to a specific location in the JSON tree.
-    - `.child(child_name)`: Navigates to a child node.
-    - `.push()`: Generates a unique, chronological key (like Firestore's auto-ID).
-    - `.set(data)`: Writes data to the specified location, overwriting any existing data.
-    """
-    try:
-        # Create a reference to the user's messages path
-        # Example path: messages/cli-rtdb-test-user-123
-        user_messages_ref = root_ref.child(f'messages/{CLI_USER_ID}')
-
-        # Use push() to generate a unique key for each new message (like auto-IDs in Firestore)
-        new_message_ref = user_messages_ref.push()
-
-        # Data to be stored (Python dictionary, which becomes JSON in Realtime Database)
-        data = {
-            'text': message_text,
-            'timestamp': datetime.now().isoformat(), # Use ISO format for easy sorting/reading
-            'status': 'new'
-        }
-
-        # Set the data at the new_message_ref location
-        new_message_ref.set(data)
-        
-        print(f"\nMessage added with key: {new_message_ref.key}")
-        print(f"  Message: '{message_text}'")
-        print(f"  Stored at path: {new_message_ref.path}")
-
-    except Exception as e:
-        print(f"\nERROR: Failed to add message: {e}")
-
-def listen_to_messages():
-    """
-    Sets up a real-time listener for messages in the user's collection.
-
-    Realtime Database Syntax:
-    - `.listen(callback)`: Registers a callback for real-time changes at the reference's location.
-                           The callback receives a `DataSnapshot` object.
-    - `DataSnapshot.val()`: Retrieves the data at the snapshot's location.
-    - `DataSnapshot.key`: Retrieves the key of the data at the snapshot's location.
-    - Realtime Database listeners by default retrieve the *entire* subtree at the listened path.
-      For sorting, you often need to fetch the data and sort it client-side,
-      or use more advanced queries like `order_by_child()` or `order_by_key()`
-      which are typically used with `get()` or when structuring for specific queries.
-      For simple real-time updates of a list, listening to the parent and iterating is common.
-    """
-    user_messages_ref = root_ref.child(f'messages/{CLI_USER_ID}')
-
-    def on_data_change(event):
-        """Callback for data changes."""
-        print(f"\n--- Realtime Database Update at: {datetime.now().isoformat()} ---")
-        if event.data is None:
-            print(f"Path '{event.path}' was deleted or is empty.")
-            return
-
-        messages_data = event.data
-        if not messages_data:
-            print("No messages yet.")
-            return
-            
-        print("Current Messages:")
-        # Sort messages by timestamp for display
-        # IMPORTANT: Add a type check to ensure msg_data is a dictionary
-        sorted_messages = []
-        for key, msg_data in messages_data.items():
-            if isinstance(msg_data, dict): # <--- ADDED TYPE CHECK HERE
-                sorted_messages.append((key, msg_data))
-            else:
-                print(f"  WARNING: Skipping invalid data for key '{key}'. Expected dictionary, got {type(msg_data)}: {msg_data}")
-
-        # Now sort only the valid dictionary entries
-        sorted_messages.sort(key=lambda item: item[1].get('timestamp', ''), reverse=True) # Newest first
-
-        for key, msg_data in sorted_messages:
-            timestamp_str = msg_data.get('timestamp', 'N/A')
-            text = msg_data.get('text', 'No text')
-            print(f"  ID: {key}, Message: '{text}', Timestamp: {timestamp_str}")
-        print("---------------------------------------")
-
-    # Start listening for real-time updates
-    # The `listen` method returns a `threading.Event` which can be used to stop the listener.
-    print(f"Listening for messages in '{user_messages_ref.path}'...")
-    listener_event = user_messages_ref.listen(on_data_change)
-    return listener_event
-
-def clear_all_messages():
-    """
-    Deletes all messages in the user's messages path.
-
-    Realtime Database Syntax:
-    - `.set(None)`: Deletes data at the specified reference. Setting a reference to `None` removes it.
-    """
-    try:
-        user_messages_ref = root_ref.child(f'messages/{CLI_USER_ID}')
-        
-        # Get the current data to count how many items will be deleted
-        current_data = user_messages_ref.get()
-        if current_data:
-            num_deleted = len(current_data)
-            user_messages_ref.set(None) # Delete the entire subtree
-            print(f"Successfully deleted {num_deleted} messages from '{user_messages_ref.path}'.")
+    # If there are no (valid) credentials available or scopes are insufficient, let the user log in.
+    # Check if existing creds have all required scopes
+    if not creds or not creds.valid or set(SCOPES) != set(creds.scopes):
+        if creds and creds.expired and creds.refresh_token:
+            print("Access token expired or scopes insufficient, attempting to refresh/re-authorize...")
+            try:
+                # Attempt to refresh first, which might also pick up new scopes if minor,
+                # but often a full re-auth is needed if scopes change significantly.
+                creds.refresh(Request())
+                if set(SCOPES) != set(creds.scopes): # Still check if all scopes were granted after refresh
+                    raise ValueError("Refreshed token does not cover all required scopes.")
+            except Exception as e:
+                print(f"Refresh failed or scopes insufficient ({e}). Initiating full OAuth 2.0 flow...")
+                flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
+                creds = flow.run_local_server(port=0)
         else:
-            print(f"No messages found in '{user_messages_ref.path}' to clear.")
+            print("No valid credentials found or scopes insufficient. Initiating full OAuth 2.0 flow...")
+            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
 
-    except Exception as e:
-        print(f"Error clearing messages: {e}")
-
-# --- CLI Application Loop ---
-def run_cli_app():
-    """Runs the interactive command-line application."""
-    print(f"\n--- Realtime Database CLI Messaging App (User: {CLI_USER_ID}) ---")
-    print("Commands:")
-    print("  add <your message> - Add a new message")
-    print("  clear              - Clear all your messages")
-    print("  exit               - Exit the app")
-    print("------------------------------------------")
-
-    # Start the real-time listener. This runs in a separate thread.
-    detach_listener_event = listen_to_messages()
+        # Save the credentials for the next run
+        with open(TOKEN_FILE, 'wb') as token:
+            pickle.dump(creds, token)
+        print(f"Credentials saved to {TOKEN_FILE}")
 
     try:
-        while True:
-            command = input("\nEnter command: ").strip().lower()
-            
-            if command.startswith("add "):
-                message_text = command[4:].strip()
-                if message_text:
-                    add_message(message_text)
-                else:
-                    print("Usage: add <your message>")
-            elif command == "clear":
-                confirm = input("Are you sure you want to clear ALL messages? (yes/no): ").lower()
-                if confirm == "yes":
-                    clear_all_messages()
-                else:
-                    print("Clear operation cancelled.")
-            elif command == "exit":
-                print("Exiting application...")
-                break
-            else:
-                print("Invalid command. Please use 'add <message>', 'clear', or 'exit'.")
-            
-            # Small pause for readability in console. The listener is async.
-            time.sleep(0.1) 
+        service = build('drive', 'v3', credentials=creds)
+        print("User authenticated successfully via OAuth 2.0.")
+        return service
+    except Exception as e:
+        print(f"Error building Drive service: {e}")
+        return None
 
-    except KeyboardInterrupt:
-        print("\nCtrl+C detected. Exiting application...")
-    finally:
-        # Detach the listener to clean up resources
-        if detach_listener_event:
-            detach_listener_event.set() # Signal the listener thread to stop
-            print("Realtime Database listener detached.")
+# --- Upload Function (Remains unchanged) ---
+def upload_file_to_drive(service, file_path, file_name, folder_id):
+    """Uploads a file to a specified Google Drive folder."""
+    try:
+        file_metadata = {
+            'name': file_name,
+            'parents': [folder_id]
+        }
+        
+        # Determine the MIME type of the file
+        mime_type = "application/octet-stream"
+        if file_path.lower().endswith((".jpg", ".jpeg")):
+            mime_type = "image/jpeg"
+        elif file_path.lower().endswith(".png"):
+            mime_type = "image/png"
+        elif file_path.lower().endswith(".pdf"):
+            mime_type = "application/pdf"
+        elif file_path.lower().endswith(".txt"):
+            mime_type = "text/plain"
 
-if __name__ == "__main__":
-    run_cli_app()
+        media = MediaFileUpload(file_path, mimetype=mime_type, resumable=True)
+        
+        file = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id,name,webViewLink'
+        ).execute()
 
+        print(f"File '{file.get('name')}' uploaded successfully to folder ID: {folder_id}")
+        print(f"View link: {file.get('webViewLink')}")
+        return file.get('id')
+
+    except HttpError as error:
+        print(f"An API error occurred: {error}")
+        if error.resp.status == 403:
+            print("Error 403: Permission denied. Ensure the authenticated Google account has 'Editor' or 'Contributor' access to the target folder.")
+            print(f"Target Folder ID: {folder_id}")
+        elif error.resp.status == 404:
+            print(f"Error 404: Folder not found. The folder ID '{folder_id}' might be incorrect or the folder might have been moved/deleted.")
+        else:
+            print(f"Error details: {error.resp.status}, {error.content.decode()}")
+        return None
+    except FileNotFoundError:
+        print(f"Error: Local file not found at '{file_path}'. Please check the path.")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred during upload: {e}")
+        return None
+
+# --- Main Execution ---
+if __name__ == '__main__':
+    # Create a dummy file for testing if it doesn't exist
+    if not os.path.exists(LOCAL_FILE_PATH):
+        try:
+            with open(LOCAL_FILE_PATH, 'w') as f:
+                f.write("This is a test file created by the OAuth app.\n")
+                f.write("Timestamp: " + str(os.path.getmtime(os.path.dirname(LOCAL_FILE_PATH) + "/requirements.txt")) + "\n")
+            print(f"Created a dummy file for testing at: {LOCAL_FILE_PATH}")
+        except Exception as e:
+            print(f"Could not create dummy file at '{LOCAL_FILE_PATH}': {e}")
+            print("Please create the file manually or adjust LOCAL_FILE_PATH to an existing file.")
+            exit()
+
+    drive_service = authenticate_user_oauth()
+
+    if drive_service:
+        file_id = upload_file_to_drive(drive_service, LOCAL_FILE_PATH, FILE_NAME_IN_DRIVE, SHARED_FOLDER_ID)
+        if file_id:
+            print(f"File upload process completed. New file ID: {file_id}")
+        else:
+            print("File upload failed.")
+    else:
+        print("Application stopped due to authentication failure.")

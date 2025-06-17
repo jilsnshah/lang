@@ -20,7 +20,8 @@ from firebase_admin import credentials # Generally not needed if using ADC, but 
 import sys
 import time
 from datetime import datetime
-
+import re
+import json
 FIREBASE_DATABASE_URL = "https://diesel-ellipse-463111-a5-default-rtdb.asia-southeast1.firebasedatabase.app/"
 firebase_app = None # To hold the initialized Firebase app instance
 try:
@@ -41,13 +42,14 @@ except Exception as e:
 # All operations start from this reference
 root_ref = db.reference('/')
 
-
+bot_response =""
 # Import the necessary functions and components from your mainlogic.py
 from mainlogic import (
     get_calendar_service_oauth,
     create_tools,
     ChatOpenAI,
     hub,
+    Tool,
     create_structured_chat_agent,
     AgentExecutor,
     ConversationBufferMemory,
@@ -60,7 +62,9 @@ from mainlogic import (
     RunnableLambda,
     RunnableMap,
     ls,
-    sl
+    sl,
+    get_drive,
+    upload_drive
 )
 output_parser = StrOutputParser()
 # ==============================================================================
@@ -101,14 +105,187 @@ model = llm
 
 
 # --- Global state for each user (for simplicity; ideally use a database) ---
-namebook = {}
+
 # ==============================================================================
 # 3. HELPER FUNCTIONS FOR BOT LOGIC INTEGRATION
 # ==============================================================================
-def update_db(user_id,session) :
-    user_sessions_fb.child(user_id).set(session)
+def handle_production_quotation(parent_message_sid_from_prod_reply, prod_message_body, prod_media_urls):
+    """
+    Handles an incoming message from the production team, assumed to be a quotation reply.
+    Identifies the original user and forwards the quotation by fetching parent message body.
+    """
+    print(f"\n--- Handling Production Team Quotation (Parent SID: {parent_message_sid_from_prod_reply}) ---")
+    
+    original_user_id = None
+    case_id = None
 
-print("hehe",ls(ConversationBufferMemory(memory_key="chat_history", return_messages=True)))
+    try:
+        # Fetch the original message that was replied to
+        parent_message = twilio_client.messages(parent_message_sid_from_prod_reply).fetch()
+        parent_message_body = parent_message.body
+        print(f"Fetched parent message body: '{parent_message_body}'")
+
+        # Parse the original user ID and case ID from the parent message body
+        # Example format: "Image from whatsapp:+1234567890 for case: uuid-1234"
+        match = re.search(r"Image from (whatsapp:\+\d+) for case: ([\w-]+)", parent_message_body)
+        if match:
+            original_user_id = match.group(1)
+            case_id = match.group(2)
+            print(f"Parsed original user: {original_user_id}, Case ID: {case_id}")
+        else:
+            print(f"ERROR: Could not parse original user ID or case ID from parent message body: '{parent_message_body}'")
+            # Optionally, send a message back to the production team that the reply could not be matched
+            twilio_client.messages.create(
+                from_=TWILIO_WHATSAPP_NUMBER,
+                to=FORWARD_TO_WHATSAPP_NUMBER,
+                body="Could not process your reply. The original forwarded message's body did not contain expected user/case info. Please provide the case ID if sending a new quotation."
+            )
+            return
+
+    except Exception as e:
+        print(f"ERROR: Could not fetch or parse parent message (SID: {parent_message_sid_from_prod_reply}): {e}")
+        twilio_client.messages.create(
+            from_=TWILIO_WHATSAPP_NUMBER,
+            to=FORWARD_TO_WHATSAPP_NUMBER,
+            body="An error occurred trying to process your reply. Please ensure you are replying to a forwarded image."
+        )
+        return
+
+    if not original_user_id or not case_id:
+        print(f"ERROR: Original user ID or case ID missing after parsing. Cannot process quotation.")
+        return
+
+    # 2. Get the original user's session data
+    original_user_session = user_sessions_fb.child(original_user_id).get()
+    if not original_user_session:
+        print(f"ERROR: Original user session not found for {original_user_id}. Cannot update quotation.")
+        return
+    
+    original_user_session = dict(original_user_session) # Ensure it's a mutable dict
+
+    # 3. Update the original user's case with quotation details
+    cases = original_user_session.get('cases', {})
+    current_case = cases.get(case_id, {})
+    
+    current_case['quotation_text'] = prod_message_body
+    current_case['quotation_media_links'] = []
+    
+    if prod_media_urls:
+        # If production team sends media back, download and upload to drive, then store link
+        for url in prod_media_urls:
+            try:
+                # Download with authentication
+                response = requests.get(url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+                response.raise_for_status()
+                
+                content_type = response.headers.get('Content-Type')
+                extension = mimetypes.guess_extension(content_type) or '.bin'
+                temp_file_name = f"{uuid.uuid4()}{extension}"
+                temp_file_path = os.path.join(MEDIA_TEMP_DIR, temp_file_name)
+
+                with open(temp_file_path, 'wb') as f:
+                    f.write(response.content)
+                
+                drive_link = upload_drive(temp_file_path, temp_file_name, content_type)
+                if drive_link:
+                    current_case['quotation_media_links'].append(drive_link)
+                    delete_file_after_delay(temp_file_path, delay=5)
+                else:
+                    print(f"Failed to upload production media to Drive: {url}")
+
+            except Exception as e:
+                print(f"Error processing production media {url}: {e}")
+
+    current_case['status'] = 'quoted'
+    current_case['quoted_at'] = datetime.now().isoformat()
+    cases[case_id] = current_case
+    original_user_session['cases'] = cases
+    original_user_session['current_stage'] = 'awaiting_quote_confirmation' # Transition original user
+    original_user_session['last_question'] = f"The quotation for your case (ID: {case_id}) is ready. Would you like to review it?"
+    
+    update_db(original_user_id, original_user_session)
+    
+    # 4. Auto-send quotation message to original user
+    send_message_to_user(original_user_id, case_id, current_case)
+    print(f"Quotation processed and message triggered for {original_user_id}.")
+
+
+def send_message_to_user(user_id, case_id, case_data):
+    """Sends the quotation details to the original user."""
+    quote_text = case_data.get('quotation_text', "Your quotation is ready!")
+    quote_media = case_data.get('quotation_media_links', [])
+
+    message_body = f"Hello! The quotation for your case (ID: {case_id}) is ready.\n\n{quote_text}\n\nDo you want to proceed with this quotation?"
+    
+    try:
+        # Send text message
+        twilio_client.messages.create(
+            from_=TWILIO_WHATSAPP_NUMBER,
+            to=user_id,
+            body=message_body
+        )
+        print(f"Sent quotation text to {user_id} for case {case_id}.")
+
+        # Send media messages if any
+        for media_link in quote_media:
+            twilio_client.messages.create(
+                from_=TWILIO_WHATSAPP_NUMBER,
+                to=user_id,
+                media_url=[media_link]
+            )
+            print(f"Sent quotation media to {user_id} for case {case_id}.")
+
+    except Exception as e:
+        print(f"ERROR sending quotation to user {user_id}: {e}")
+    """Sends the quotation details to the original user."""
+    quote_text = case_data.get('quotation_text', "Your quotation is ready!")
+    quote_media = case_data.get('quotation_media_links', [])
+
+    message_body = f"Hello! The quotation for your case (ID: {case_id}) is ready.\n\n{quote_text}\n\nDo you want to proceed with this quotation?"
+    
+    try:
+        # Send text message
+        twilio_client.messages.create(
+            from_=TWILIO_WHATSAPP_NUMBER,
+            to=user_id,
+            body=message_body
+        )
+        print(f"Sent quotation text to {user_id} for case {case_id}.")
+
+        # Send media messages if any
+        for media_link in quote_media:
+            twilio_client.messages.create(
+                from_=TWILIO_WHATSAPP_NUMBER,
+                to=user_id,
+                media_url=[media_link]
+            )
+            print(f"Sent quotation media to {user_id} for case {case_id}.")
+
+    except Exception as e:
+        print(f"ERROR sending quotation to user {user_id}: {e}")
+def register_dentist(details: str) -> str:
+        """Registers a new dentist and updates state.
+        Input format: Name, Phone Number, Clinic, License Number.
+        """
+        try:
+            name, phone_number, clinic, license_number = [x.strip() for x in details.split(",")]
+            
+            cleaned_phone_number = phone_number.replace("whatsapp:", "").strip()
+            if not cleaned_phone_number.startswith('+'):
+                print(f"Warning: Phone number '{phone_number}' does not start with '+'. Attempting to prepend '+'.")
+                cleaned_phone_number = '+' + cleaned_phone_number
+            user_sessions_fb.child("whatsapp:"+str(phone_number)).update({
+                "name": name,
+                "clinic": clinic,
+                "license": license_number
+            })
+
+            return f"{name} has been successfully registered you should simply greet them now."
+        except Exception as e:
+            return f"Invalid format. Please use: Name, Phone Number, Clinic, License Number. Error: {e}"
+
+def update_db(user_id,session) :
+    user_sessions_fb.child(user_id).update(session)
 def initialize_user_session(user_id):
     """Initializes the session state for a new user."""
     user_sessions_fb.child(user_id).set({
@@ -174,29 +351,28 @@ def forward_media_to_number(media_url, sender_whatsapp_id):
             temp_media_file.write(response.content)
 
         print(f"Media downloaded to temporary file: {temp_file_path}")
-
+        print(sender_whatsapp_id)
+        client_fb =user_sessions_fb.child(sender_whatsapp_id)
+        caseid = client_fb.child('active').get()
         # Construct the public URL for the temporary file
-        NGROK_URL = os.getenv("NGROK_URL")
-        if not NGROK_URL:
-             print("WARNING: NGROK_URL not set. Media forwarding URL will not be publicly accessible.")
-             public_media_url = f"http://localhost:5000/media/{temp_file_name}"
-        else:
-             public_media_url = f"{NGROK_URL}/media/{temp_file_name}"
+        drive_link = upload_drive(temp_file_path, temp_file_name, content_type,client_fb.child('name').get(),client_fb.child(caseid).child('name').get())
+        if not drive_link:
+            print("Failed to upload file to Google Drive. Cannot forward media.")
+            return False
 
-        print(f"Public media URL for forwarding: {public_media_url}")
-
-        # Now, forward the media using the public URL
+        # Now, forward the media using the Google Drive public URL
         message = twilio_client.messages.create(
             from_=TWILIO_WHATSAPP_NUMBER,
-            to=FORWARD_TO_WHATSAPP_NUMBER,
-            media_url=[public_media_url], # <--- Pass the publicly accessible HTTP/HTTPS URL
-            body=f"Image from {sender_whatsapp_id} for new case submission."
+            to="whatsapp:+917801833884",
+            media_url=[drive_link], # <--- Pass the Google Drive public URL
+            body=f"Image from {sender_whatsapp_id} for case: {caseid}"
         )
-        print(f"Media forwarded. Message SID: {message.sid}")
+        print(f"Media forwarded via Google Drive. Message SID: {message.sid}")
 
-        # Schedule temporary file for deletion after a delay
-        delete_file_after_delay(temp_file_path, delay=30) # Give Twilio 30 seconds to fetch
+        # Schedule temporary local file for deletion (it's no longer needed after Drive upload)
+        delete_file_after_delay(temp_file_path, delay=5) # 
         return True
+
     except requests.exceptions.HTTPError as e:
         print(f"HTTP Error downloading media from Twilio: {e.response.status_code} - {e.response.text}")
         if temp_file_name and os.path.exists(os.path.join(MEDIA_TEMP_DIR, temp_file_name)):
@@ -210,13 +386,14 @@ def forward_media_to_number(media_url, sender_whatsapp_id):
 
 
 def handle_bot_logic(user_id, message_body, num_media, media_urls,session):
+    caseid =""
     if session['auth_memory'] :
         print("here auth")
         session['auth_memory'] = sl(session['auth_memory'])
     else :
         session['auth_memory'] = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
     if session['sched_memory'] :
-        session['sched_memory'] = sl(session['auth_memory'])
+        session['sched_memory'] = sl(session['sched_memory'])
     else :
         session['sched_memory'] = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
     
@@ -253,8 +430,14 @@ User's Response: {input}
     if not session['calendar_service']:
         print("Calendar service not initialized.")
         return "Sorry, I'm unable to connect to the calendar service at the moment. Please try again later."
-
-    auth_tools, scheduling_tools = create_tools(session['calendar_service'], session['app_state'])
+    auth_tools = [
+        Tool(
+            name="DentistRegistrar",
+            func=register_dentist,
+            description="Register a new dentist. Input format: Name, Phone Number, Clinic, License Number. confirms you have collected all required fields."
+        )
+    ]
+    scheduling_tools = create_tools(session['calendar_service'])
     output_parser = StrOutputParser()
 
     # --- Authorization Stage ---
@@ -265,18 +448,9 @@ User's Response: {input}
         pure_sender_phone = user_id.replace("whatsapp:", "").strip()
 
         # Manually check authorization
-        auth_result = auth_tools[0](user_id)
-
-        if isinstance(auth_result, str) and "authorized" in auth_result.lower():
-            # Already authorized: move to next stage
-            session['current_stage'] = 'intent'
-            bot_response = "Welcome to 3D-Align. How can I assist you today?"
-            print("Authorization confirmed. Transitioning to 'intent' stage.")
-
-        else:
-            # Not authorized: run registration agent
-            print("Dentist not authorized. Invoking registration agent.")
-            registration_prompt = hub.pull("hwchase17/structured-chat-agent") + '''
+        # Not authorized: run registration agent
+        print("Dentist not authorized. Invoking registration agent.")
+        registration_prompt = hub.pull("hwchase17/structured-chat-agent") + '''
 
 You are a friendly assistant helping register dentists to 3D-Align.
 
@@ -313,32 +487,32 @@ Start the interaction with a warm greeting and an offer to help with registratio
 '''
 
             # Create agent and executor for registration only
-            auth_agent = create_structured_chat_agent(llm=llm, tools=[auth_tools[1]], prompt=registration_prompt)
-            auth_executor = AgentExecutor.from_agent_and_tools(
+        auth_agent = create_structured_chat_agent(llm=llm, tools=auth_tools, prompt=registration_prompt)
+        auth_executor = AgentExecutor.from_agent_and_tools(
                 agent=auth_agent, tools=auth_tools, verbose=True, memory=session['auth_memory'], handle_parsing_errors=True
             )
 
             # Prepare input message
-            input_to_agent = message_body
-            if not session['auth_memory'].chat_memory.messages or (
+        input_to_agent = message_body
+        if not session['auth_memory'].chat_memory.messages or (
                 len(session['auth_memory'].chat_memory.messages) == 1 and isinstance(session['auth_memory'].chat_memory.messages[0], SystemMessage)
             ):
-                input_to_agent = f"User's phone number: {pure_sender_phone}. User says: {message_body}"
-                print(f"First registration input crafted: {input_to_agent}")
-                session['auth_memory'].chat_memory.add_message(HumanMessage(content=input_to_agent))
+            input_to_agent = f"User's phone number: {pure_sender_phone}. User says: {message_body}"
+            print(f"First registration input crafted: {input_to_agent}")
+            session['auth_memory'].chat_memory.add_message(HumanMessage(content=input_to_agent))
 
-            try:
-                response = auth_executor.invoke({"input": input_to_agent})
-                bot_response = response["output"]
-                print(f"Registration agent response: {bot_response}")
+        try:
+            response = auth_executor.invoke({"input": input_to_agent})
+            bot_response = response["output"]
+            print(f"Registration agent response: {bot_response}")
 
-                if "Registration successful" in bot_response:
-                    session['current_stage'] = 'intent'
-                    session['auth_memory'].clear()
+            if "Registration successful" in bot_response:
+                session['current_stage'] = 'intent'
+                session['auth_memory'].clear()
 
-            except Exception as e:
-                print(f"Error during registration agent execution: {e}")
-                return "An error occurred during registration. Please try again."
+        except Exception as e:
+            print(f"Error during registration agent execution: {e}")
+            return "An error occurred during registration. Please try again."
 
     # --- Intent Detection Stage ---
     elif session['current_stage'] == 'intent':
@@ -361,6 +535,11 @@ Start the interaction with a warm greeting and an offer to help with registratio
 
         if 'submit_case' in session['app_state']:
             session['current_stage'] = 'awaiting_images'
+            caseid = str(uuid.uuid4())
+            session[caseid] ={}
+            session['active'] = caseid
+            session[caseid]['quote'] = "..." 
+            session[caseid]['name'] = caseid
             bot_response = """Thank you for considering 3D-Align for your aligner case.
 Kindly share clear images of the patient's case so we can prepare an accurate quotation. Once you receive the quotation, you may discuss it with the patient, and upon confirmation, we’ll proceed with the next steps.
 """
@@ -370,8 +549,7 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
             session['current_stage'] = 'tracking_case'
             print(f"Transitioned to 'tracking_case' stage. Bot response: {bot_response}")
         elif session['app_state'] == 'none':
-            bot_response = llm.invoke({"input":message_body})
-
+            bot_response = llm.invoke(message_body).content
     # --- Awaiting Images Stage ---
     elif session['current_stage'] == 'awaiting_images':
         print("Processing in 'awaiting_images' stage...")
@@ -395,11 +573,7 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
             if session['image_count'] > 0 or manual_test:
                 bot_response = f"Thank you for submitting { session['image_count'] } image(s). We will review them and get back to you with a quotation shortly"
                 session['current_stage'] = 'awaiting_quote'
-                session['image_count'] = 0 # Reset image count
-                caseid = str(uuid.uuid4())
-                session[caseid] ={}
-                session['active'] = caseid
-                session[caseid]['quote'] = "..." 
+                session['image_count'] = 0 # Reset image count 
                 print(f"Transitioned to 'scheduling_quote_confirm'. Bot response: {bot_response}")
             else:
                 bot_response = "You haven't sent any images yet. Please send images to proceed further"
@@ -484,8 +658,8 @@ Your task:
         if '`' in get_name :
             bot_response = get_name
         else :
-            #session[session['active']]['name'] = get_name
-            #namebook[session['active']] = get_name
+            session[session['active']]['name'] = get_name
+            root_ref.child('namebook').child(session['active']).set(get_name)
             message_body = "Hi"
             session['current_stage'] = 'scheduling_appointment'
     if session['current_stage'] == 'scheduling_appointment':
@@ -603,62 +777,94 @@ Rules:
 # ==============================================================================
 # 4. FLASK ROUTES
 # ==============================================================================
-@app.route('/media/<filename>')
-def serve_media(filename):
-    """Serve media files from the temporary directory."""
-    print(f"Attempting to serve file: {filename} from {MEDIA_TEMP_DIR}")
-    return send_from_directory(MEDIA_TEMP_DIR, filename)
-
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_webhook():
     """
     Twilio webhook endpoint for incoming WhatsApp messages.
     """
+
+
+    msg = twilio_client.messages.create(
+    from_='whatsapp:+14155238886',
+    to='whatsapp:+917801833884',
+    body='✅ Please swipe reply to *this* message.'
+    )
+
+    print(f"Sent message SID: {msg.sid}")
+
     incoming_msg = request.values.get("Body", "")
     sender_id = request.values.get("From", "")
     num_media = int(request.values.get("NumMedia", 0))
     latitude = request.form.get("Latitude")
     longitude = request.form.get("Longitude")
-    
-    if latitude and longitude:
-        # Store this in your session/memory for the LangTune agent
-        location_url = f"https://www.google.com/maps?q={latitude},{longitude}"
-        print("User location received:", location_url)
-        incoming_msg = location_url
-    media_urls = []
-    # Remove the redundant `location_url =[]` line as it's not used and can cause confusion.
-    # media_urls should be sufficient.
+    parent_message_sid_from_prod_reply = request.values.get("OriginalRepliedMessageSid", None)
+    for key in request.values:
+        print(f"{key}: {request.values.get(key)}")
 
+    prod_media_urls = []
     if num_media > 0:
         for i in range(num_media):
             media_url = request.values.get(f"MediaUrl{i}")
-            media_urls.append(media_url)
-            print(f"Received media URL: {media_url}")
+            if media_url:
+                prod_media_urls.append(media_url)
 
-    
-    session = user_sessions_fb.child(sender_id).get()
-    if session is not None :
-        bot_response = handle_bot_logic(sender_id, incoming_msg, num_media, media_urls, session)
+    # Check if the message is from the production team's number AND it's a reply
+    if sender_id == "whatsapp:+917801833884":
+        print(f"Received reply from production team ({sender_id}) with parent SID: {parent_message_sid_from_prod_reply}")
+        """
+        # Call the function to handle the quotation from the production team
+        handle_production_quotation(
+            parent_message_sid_from_prod_reply, # The SID of the message our bot sent to prod
+            incoming_msg,                        # The text body of prod's reply (the quotation)
+            prod_media_urls                      # Any media (images/docs) attached to prod's reply
+        )
+        """
+        resp = MessagingResponse()
+        # You might want to send a confirmation back to the production team here
+        # resp.message("Quotation received and being processed for the customer.")
+        return str(resp)
     else :
-        initialize_user_session(sender_id)
 
-    resp = MessagingResponse()
-    if bot_response:
-         message = twilio_client.messages.create(
-                from_=TWILIO_WHATSAPP_NUMBER,
-                to=sender_id,
-                body=bot_response
-            )
-    else:
-        print("WARNING: bot_response was empty or None. Sending a generic message.")
-        # Ensure a message is always added to the response, even if bot_response is empty
-        msg = resp.message("Sorry, I'm having trouble generating a response right now. Please try again.")
+        if latitude and longitude:
+            # Store this in your session/memory for the LangTune agent
+            location_url = f"https://www.google.com/maps?q={latitude},{longitude}"
+            print("User location received:", location_url)
+            incoming_msg = location_url
+        media_urls = []
+        # Remove the redundant `location_url =[]` line as it's not used and can cause confusion.
+        # media_urls should be sufficient.
 
-    # IMPORTANT: REMOVE these print statements! They interfere with the HTTP response.
-    # print(resp) 
-    # print(msg) 
-    
-    return str(resp) # This is the ONLY line that should send the TwiML to Twilio
+        if num_media > 0:
+            for i in range(num_media):
+                media_url = request.values.get(f"MediaUrl{i}")
+                media_urls.append(media_url)
+                print(f"Received media URL: {media_url}")
+
+        
+        session = user_sessions_fb.child(sender_id).get()
+        if session is not None :
+            session = dict(session)
+            bot_response = handle_bot_logic(sender_id, incoming_msg, num_media, media_urls, session)
+        else :
+            initialize_user_session(sender_id)
+
+        resp = MessagingResponse()
+        if bot_response:
+            message = twilio_client.messages.create(
+                    from_=TWILIO_WHATSAPP_NUMBER,
+                    to=sender_id,
+                    body=bot_response
+                )
+        else:
+            print("WARNING: bot_response was empty or None. Sending a generic message.")
+            # Ensure a message is always added to the response, even if bot_response is empty
+            msg = resp.message("Sorry, I'm having trouble generating a response right now. Please try again.")
+
+        # IMPORTANT: REMOVE these print statements! They interfere with the HTTP response.
+        # print(resp) 
+        # print(msg) 
+        
+        return str(resp) # This is the ONLY line that should send the TwiML to Twilio
 
 
 # ==============================================================================
@@ -682,9 +888,9 @@ if __name__ == "__main__":
         print("   Media forwarding will likely FAIL as Twilio cannot access localhost.")
         print("   Please run ngrok (e.g., `ngrok http 5000`) and set NGROK_URL in your .env file")
         print("   to the HTTPS URL ngrok provides (e.g., https://xxxxxxxxxxxx.ngrok-free.app).\n")
-    manual_test = True
+    manual_test = False
     while manual_test:
-        sender_id = "whatsapp:+917801833899"
+        sender_id = "whatsapp:+917801833800"
         num_media = 0
         media_urls =[]
         session = user_sessions_fb.child(sender_id).get()
@@ -692,7 +898,6 @@ if __name__ == "__main__":
             incoming_msg = input("user :")
             print(session)
             session = dict(session)
-            session['calender_service'] = get_calendar_service_oauth()
             bot_response = handle_bot_logic(sender_id, incoming_msg, num_media, media_urls, session)
         else :
             initialize_user_session(sender_id)

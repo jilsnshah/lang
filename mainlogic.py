@@ -4,7 +4,13 @@
 import os
 import datetime
 import pytz
-
+import os
+import pickle
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
 # Third-party libraries
 from dotenv import load_dotenv
 
@@ -35,8 +41,12 @@ load_dotenv()
 # --- Configuration Constants ---
 CLIENT_SECRET_FILE = 'client_secret.json'
 TOKEN_FILE = 'token.json'
-CALENDAR_ID = 'jilsnshah@gmail.com' # Replace with your actual calendar ID
-SCOPES = ['https://www.googleapis.com/auth/calendar']
+CALENDAR_ID = 'cat11july@gmail.com' # Replace with your actual calendar ID
+SCOPES = [
+    'https://www.googleapis.com/auth/drive',        # For Google Drive access
+    'https://www.googleapis.com/auth/calendar'      # For Google Calendar access (if you still need it)
+    # Add other Calendar scopes if you use more specific ones, e.g., 'https://www.googleapis.com/auth/calendar.events'
+] 
 
 # --- LLM Initialization ---
 llm = ChatOpenAI(
@@ -49,27 +59,143 @@ model = llm # Using 'model' as an alias for consistency with the original code.
 # --- Mock Dentist Database ---
 # Changed keys to phone numbers
 authorized_dentists = {
-    "+919898928288": { # Example phone number (ensure it's in E.164 format, e.g., +CCXXXXXXXXXX)
-        "name": "Dr. Jils Shah",
-        "clinic": "Smile Dental Studio",
-        "license": "GJ12345"
-    },
-    "+917801833884": { # Example phone number (ensure it's in E.164 format, e.g., +CCXXXXXXXXXX)
-        "name": "Dr. Jils Shah",
-        "clinic": "Smile Dental Studio",
-        "license": "GJ12345"
-    },
-    "+919898864413": { # Example phone number (ensure it's in E.164 format, e.g., +CCXXXXXXXXXX)
-        "name": "Dr. Jils Shah",
-        "clinic": "Smile Dental Studio",
-        "license": "GJ12345"
-    }
+
     # Add more dentists as needed
 }
 
 # ==============================================================================
-# 3. GOOGLE CALENDAR SERVICE
+# 3. GOOGLE SERVICE
 # ==============================================================================
+def get_drive():
+    """Authenticates a user via OAuth 2.0 and returns a Drive service object."""
+    creds = None
+    
+    # The file token.json stores the user's access and refresh tokens.
+    # It must be read as text (not binary) because it's JSON.
+    if os.path.exists(TOKEN_FILE):
+        try:
+            # Use Credentials.from_authorized_user_file to load JSON token
+            creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+            print(f"Loaded credentials from {TOKEN_FILE}.")
+        except Exception as e:
+            # Handle cases where token.json might be corrupted or malformed JSON
+            print(f"Error loading credentials from {TOKEN_FILE}: {e}. Will re-authenticate.")
+            if os.path.exists(TOKEN_FILE):
+                os.remove(TOKEN_FILE) # Delete potentially corrupted file
+            creds = None
+
+    # If there are no (valid) credentials available or scopes are insufficient, let the user log in.
+    # Check if existing creds have all required scopes
+    # Use 'in' operator to check if all required scopes are covered, as creds.scopes might contain more
+    if not creds or not creds.valid or not all(s in (creds.scopes if creds.scopes else []) for s in SCOPES):
+        if creds and creds.expired and creds.refresh_token:
+            print("Access token expired or scopes insufficient, attempting to refresh/re-authorize...")
+            try:
+                creds.refresh(Request())
+                # After refresh, re-check if all scopes are covered
+                if not all(s in (creds.scopes if creds.scopes else []) for s in SCOPES):
+                     raise ValueError("Refreshed token does not cover all required scopes. Initiating full OAuth flow.")
+            except (RefreshError, ValueError) as e: # Catch RefreshError and our custom ValueError
+                print(f"Refresh failed or scopes insufficient ({e}). Initiating full OAuth 2.0 flow...")
+                # If refresh fails or scopes are still not enough, re-authenticate fully
+                flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
+                creds = flow.run_local_server(port=0)
+            except Exception as e: # Catch other potential errors during refresh
+                print(f"An unexpected error occurred during refresh: {e}. Initiating full OAuth 2.0 flow...")
+                flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
+                creds = flow.run_local_server(port=0)
+        else:
+            print("No valid credentials found or scopes insufficient. Initiating full OAuth 2.0 flow...")
+            # If no creds or refresh not possible, do full authentication
+            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
+
+        # Save the credentials for the next run (ALWAYS in JSON format)
+        with open(TOKEN_FILE, 'w') as token: # Use 'w' for text mode
+            token.write(creds.to_json()) # Write as JSON string
+        print(f"Credentials saved to {TOKEN_FILE}")
+
+    try:
+        service = build('drive', 'v3', credentials=creds)
+        print("Google Drive service initialized successfully.")
+        return service
+    except HttpError as e:
+        print(f"An HTTP error occurred building Drive service: {e}")
+        return None
+    except Exception as e:
+        print(f"Error building Drive service: {e}")
+        return None
+
+# The get_calendar_service_oauth function (as you provided) is already correct
+# in how it handles token.json (using creds.to_json() and Credentials.from_authorized_user_file).
+# So no changes are needed there.
+
+def get_or_create_folder(service, name, parent_id):
+    query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and '{parent_id}' in parents and trashed = false"
+    results = service.files().list(q=query, fields="files(id, name)").execute()
+    items = results.get('files', [])
+    if items:
+        return items[0]['id']
+    
+    # Folder not found, create it
+    file_metadata = {
+        'name': name,
+        'mimeType': 'application/vnd.google-apps.folder',
+        'parents': [parent_id]
+    }
+    folder = service.files().create(body=file_metadata, fields='id').execute()
+    return folder['id']
+
+from googleapiclient.http import MediaFileUpload
+# Assuming get_drive and get_or_create_folder are defined elsewhere and work correctly
+
+def upload_drive(file_path, file_name, mime_type, doc_name, patient_name):
+    """
+    Uploads a file to Google Drive and returns its direct download link.
+    """
+    drive_service = get_drive()
+    if drive_service is None:
+        print("Google Drive service not available. Cannot upload file.")
+        return None
+
+    try:
+        # Create folder structure: '3d-align' -> doc_name -> patient_name -> 'img'
+        root_folder_id = get_or_create_folder(drive_service, '3d-align', 'root')
+        doc_folder_id = get_or_create_folder(drive_service, doc_name, root_folder_id)
+        patient_folder_id = get_or_create_folder(drive_service, patient_name, doc_folder_id)
+        img_folder_id = get_or_create_folder(drive_service, 'img', patient_folder_id)
+
+        file_metadata = {'name': file_name, 'parents': [img_folder_id]}
+        media = MediaFileUpload(file_path, mimetype=mime_type, resumable=True)
+        
+        file = drive_service.files().create(body=file_metadata,
+                                            media_body=media,
+                                            fields='id, webViewLink').execute() # Keep webViewLink for logging/debugging
+        file_id = file.get('id')
+        web_view_link = file.get('webViewLink') # This is the web view link, not the direct one
+
+        # Make the file publicly accessible (read-only)
+        permission = {
+            'type': 'anyone',
+            'role': 'reader',
+            'allowFileDiscovery': False
+        }
+        drive_service.permissions().create(fileId=file_id, body=permission, fields='id').execute()
+
+        # Construct the direct download link
+        direct_download_link = f"https://drive.google.com/uc?export=download&id={file_id}"
+
+        print(f"File uploaded to Google Drive. File ID: {file_id}, Web View Link: {web_view_link}, Direct Download Link: {direct_download_link}")
+        
+        # Return the direct download link
+        return direct_download_link
+        
+    except Exception as e:
+        print(f"Error uploading file to Google Drive: {e}")
+        return None
+
+
+
 def get_calendar_service_oauth():
     """
     Initializes and returns the Google Calendar API service using OAuth 2.0 Client ID.
@@ -145,7 +271,7 @@ def sl(serializable_messages_list):
 # ==============================================================================
 # 4. TOOL DEFINITIONS
 # ==============================================================================
-def create_tools(calendar_service, app_state):
+def create_tools(calendar_service):
     """Creates all the necessary tools for the agents."""
 
     # --- Tool Functions ---
@@ -234,56 +360,10 @@ def create_tools(calendar_service, app_state):
     def confirm_appointment_and_exit(*args, **kwargs):
         """Sets the exit flag when an appointment is confirmed."""
 
-    def check_authorization(phone_number: str) -> str:
-        """Checks authorization of a dentist using their phone number.
-        The phone number should be in E.164 format (e.g., '+919876543210').
-        """
-        cleaned_phone_number = phone_number.replace("whatsapp:", "").strip()
-        print(f"Checking authorization for phone number: {cleaned_phone_number}") # Debugging
 
-        if cleaned_phone_number in authorized_dentists:
-            return f"{authorized_dentists[cleaned_phone_number]['name']} is already authorized."
-        else:
-            return {
-                "authorized": False,
-                "reason": "Dentist not found",
-                "required_fields": ["name", "phone_number", "clinic", "license"]
-            }
-
-    def register_dentist(details: str) -> str:
-        """Registers a new dentist and updates state.
-        Input format: Name, Phone Number, Clinic, License Number.
-        """
-        try:
-            name, phone_number, clinic, license_number = [x.strip() for x in details.split(",")]
-            
-            cleaned_phone_number = phone_number.replace("whatsapp:", "").strip()
-            if not cleaned_phone_number.startswith('+'):
-                print(f"Warning: Phone number '{phone_number}' does not start with '+'. Attempting to prepend '+'.")
-                cleaned_phone_number = '+' + cleaned_phone_number
-
-            authorized_dentists[cleaned_phone_number] = {
-                "name": name,
-                "clinic": clinic,
-                "license": license_number
-            }
-            return f"{name} has been successfully registered you should simply greet them now."
-        except Exception as e:
-            return f"Invalid format. Please use: Name, Phone Number, Clinic, License Number. Error: {e}"
+   
 
     # --- Tool Instantiation ---
-    auth_tools = [
-        Tool(
-            name="AuthorizationChecker",
-            func=check_authorization,
-            description="Check if a dentist is authorized using their phone number. Input should be the phone number in E.164 format (e.g., '+919876543210'). This tool should be used first with the sender's phone number without asking the user."
-        ),
-        Tool(
-            name="DentistRegistrar",
-            func=register_dentist,
-            description="Register a new dentist. Input format: Name, Phone Number, Clinic, License Number. Use this after AuthorizationChecker confirms the dentist is not found and you have collected all required fields."
-        )
-    ]
 
     scheduling_tools = [
         Tool(
@@ -299,89 +379,12 @@ def create_tools(calendar_service, app_state):
         )
     ]
 
-    return auth_tools, scheduling_tools
+    return scheduling_tools
 
 
 # ==============================================================================
 # 5. MAIN EXECUTION LOGIC (for local testing)
 # ==============================================================================
 if __name__ == "__main__":
-    # --- State Management ---
-    app_state = {
-        'state': None, # For authorization status
-        'cap': "none", # For intent capture
-        'exi': False # For exiting the scheduling loop
-    }
-
-    # --- Initializations ---
-    calendar_service = get_calendar_service_oauth()
-    if not calendar_service:
-        print("Exiting: Could not initialize calendar service.")
-        exit()
-
-    auth_tools, scheduling_tools = create_tools(calendar_service, app_state)
-    output_parser = StrOutputParser()
-
-    # --- STAGE 1: AUTHORIZATION ---
-    # ... (Authorization logic remains the same)
-
-    # --- STAGE 2: INTENT DETECTION ---
-    # ... (Intent detection logic remains the same)
-
-
-    # --- STAGE 3: SCHEDULING ---
-    if 'submit_case' in app_state['cap']:
-        print("\n--- Starting Scheduling Stage ---")
-        confirm_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an AI assistant"),
-            ("human", """User was asked a yes or no question your job is to identify if the user's response was yes or no
-                         this was the question asked {question}
-                         Here is the user's response {input}
-                         output in one word only""")
-        ])
-        confirm_chain = confirm_prompt | llm | output_parser
-
-        print('Bot:', "Thank you for approaching 3D-Align we will get back to you soon")
-        print('Bot:', 'Here is the quotation........did patient agree ?')
-        confirm = confirm_chain.invoke({"input": input("User :"), "question": "did patient agree?"})
-
-        if "No" in confirm:
-            print("Thank you for contacting 3D-Align")
-        elif "Yes" in confirm:
-            print("Do you have scanning machines or our technicians should bring them ?")
-            machine = confirm_chain.invoke({"question": "Do you have scanning machines or our technicians should bring them ?", "input": input("User :")})
-            print("Bot:", machine)
-            print("Bot: great let's decide appointment time now !!")
-
-            sched_prompt = hub.pull("hwchase17/structured-chat-agent")
-            
-            # MODIFICATION: Updated the agent's initial instructions
-            sched_initial_message = ("""
-You are a scheduling assistant. Your goal is to book a 3D-Align scanning appointment.
-
-To do this, you absolutely MUST collect two pieces of information from the user before you can book it:
-1. The desired date and time for the appointment.
-2. The full address of the clinic where the appointment will take place.
-
-Follow these steps precisely:
-- First, ask the user for BOTH their preferred date/time AND the full clinic address. Do not proceed until you have both.
-- Once you have a date and time, convert it to an ISO 8601 string (e.g., 2025-06-12T15:30) and use the `CheckCalendarAvailability` tool to see if the slot is free.
-- If the slot is available, confirm the final date, time, AND location with the user one last time.
-- ONLY when the user gives the final confirmation for all details, use the `BookCalendarAppointment` tool. You MUST provide both the 'iso_datetime_str' and the 'location' to this tool.
-- If a slot is not available, inform the user and ask for an alternative time, keeping the location you already collected.
-""")
-            sched_memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-            sched_memory.chat_memory.add_message(SystemMessage(content=sched_initial_message))
-            sched_agent = create_structured_chat_agent(llm, tools=scheduling_tools, prompt=sched_prompt)
-            sched_executor = AgentExecutor.from_agent_and_tools(
-                agent=sched_agent, tools=scheduling_tools, memory=sched_memory, handle_parsing_errors=True, verbose=True
-            )
-
-            while not app_state['exi']:
-                user_input = input("User: ")
-                if user_input.lower() in ["exit", "quit"]:
-                    break
-                response = sched_executor.invoke({"input": user_input})
-                print("Bot:", response["output"])
-
-    print("\n--- End of session ---")
+   service = get_calendar_service_oauth()
+   service = get_drive()
