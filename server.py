@@ -22,6 +22,7 @@ import time
 from datetime import datetime
 import re
 import json
+from langchain_google_genai import ChatGoogleGenerativeAI
 FIREBASE_DATABASE_URL = "https://diesel-ellipse-463111-a5-default-rtdb.asia-southeast1.firebasedatabase.app/"
 firebase_app = None # To hold the initialized Firebase app instance
 try:
@@ -101,8 +102,64 @@ llm = ChatOpenAI(
     openai_api_base="https://openrouter.ai/api/v1",
 )
 model = llm
+llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.3)
 
+#======================================
+#intent prompts
+intent_classification_prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are an helpful assistant"),
+            ("human", """You are an AI assistant for 3D Align, and your job is to classify the intent of the user's message into one of the following four categories:
 
+1. New Aligner Case Inquiry - for dentists or users who want to submit, inquire or require quotation about a **new aligner case** .
+2. Existing Aligner Case Trouble-Shoot - for issues, complaints, or help needed for an **ongoing or completed aligner case**.
+3. Aligner By-Products - for questions about **products related to aligner use**, such as chewies, aligner cases, cleaning kits, etc.
+4. Finances Related Query - for queries involving **payments, invoices, pricing, or refunds**.
+
+Respond with only the **exact name** of the category that best matches the user's message. If the message is unclear or does not match any, respond with: `Unclear Intent`.
+
+---
+
+User Message: {input}
+
+---
+
+Intent:""")
+        ])
+
+intent_chain = intent_classification_prompt | model | output_parser
+confirm_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are an AI assistant that analyzes user responses."),
+    ("human", """You are given a yes-or-no question and a user's response.
+
+Task:
+- Determine if the user's response indicates **Yes** or **No**.
+- If the response is unclear or ambiguous, return `Unknown`.
+- Respond with **only one word**: Yes, No, or Unknown.
+
+Question: {question}
+User's Response: {input}
+""")
+])
+confirm_chain = confirm_prompt | llm | output_parser
+new_aligner_case_prompt = ChatPromptTemplate.from_messages([
+    ("human","""You are an intent classifier for a dental aligner assistant chatbot.  
+Your job is to classify the user's response into one of the following intents:
+
+1. **submit_case** - if the user wants to directly submit the aligner case.
+2. **request_quotation** - if the user wants a quotation before proceeding.
+3. **other** - if the user's message does not match either of the above intents.
+
+Classify the intent based on the user's message.  
+Respond with only the intent label (`submit_case`, `request_quotation`, or `other`) and nothing else.
+
+Examples:
+- "I want to go ahead and submit the case." → `submit_case`
+- "Can I get a quotation first?" → `request_quotation`
+- "Can you help me with something else?" → `other`
+
+Now classify this message:
+{user_input}""")])
+new_aligner_case_chain = new_aligner_case_prompt | llm | output_parser
 
 # --- Global state for each user (for simplicity; ideally use a database) ---
 
@@ -401,21 +458,6 @@ def handle_bot_logic(user_id, message_body, num_media, media_urls,session):
     Integrates the bot's logic from mainlogic.py to process a single message.
     """
     global output_parser
-    confirm_prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are an AI assistant that analyzes user responses."),
-    ("human", """
-You are given a yes-or-no question and a user's response.
-
-Task:
-- Determine if the user's response indicates **Yes** or **No**.
-- If the response is unclear or ambiguous, return `Unknown`.
-- Respond with **only one word**: Yes, No, or Unknown.
-
-Question: {question}
-User's Response: {input}
-""")
-])
-    confirm_chain = confirm_prompt | llm | output_parser
 
     # ... (Code for 'auth', 'intent', 'awaiting_images' stages remains the same) ...
     # --- DEBUGGING PRINTS ---
@@ -516,41 +558,59 @@ Start the interaction with a warm greeting and an offer to help with registratio
 
     # --- Intent Detection Stage ---
     elif session['current_stage'] == 'intent':
-        print("Processing in 'intent' stage...")
-
-        intent_classification_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an helpful assistant"),
-            ("human", """Your job is to identify if the user has a new case file or patient he would like to submit or he wants to track existing case or patient
-                         Here is the User Input : {input}
-                         Output should be one word only : submit_case or track_case or none""")
-        ])
-
-        intent_chain = intent_classification_prompt | model | output_parser
+        print("Processing in 'intent' stage...")  
         try:
             session['app_state'] = intent_chain.invoke({"input": message_body})
+            print(session['app_state'])
         except Exception as e:
             print(f"Error during intent chain invocation: {e}")
             return "An error occurred while determining your intent. Please try again."
 
 
-        if 'submit_case' in session['app_state']:
-            session['current_stage'] = 'awaiting_images'
+        if 'New Aligner Case Inquiry' in session['app_state']:
+            session['current_stage'] = 'new_aligner'
+            bot_response = """Thank you for choosing 3D-Align for your aligner case.
+Please choose how you'd like to proceed with the new aligner case:
+"""
+        elif 'Unclear Intent' in session['app_state']:
+            bot_response = "Hello, welcome to 3D-Align, How may I assist you ?"
+        elif 'Aligner By-Products' in session['app_state']:
+            pass
+            
+        #atharva's code here
+    elif session['current_stage'] == 'new_aligner' :
+        session['app_state'] = new_aligner_case_chain.invoke({"user_input" : message_body})
+        if 'request_quotation' in session['app_state'] :
+            session['current_stage'] = "awaiting_images"
             caseid = str(uuid.uuid4())
             session[caseid] ={}
             session['active'] = caseid
             session[caseid]['quote'] = "..." 
             session[caseid]['name'] = caseid
-            bot_response = """Thank you for considering 3D-Align for your aligner case.
-Kindly share clear images of the patient's case so we can prepare an accurate quotation. Once you receive the quotation, you may discuss it with the patient, and upon confirmation, we’ll proceed with the next steps.
+            bot_response = """Requisite for Aligner Case Submission to 3D Align 
+
+1. Intraoral & Extraoral Photographs 
+    (Based on this we will be able to roughly give you idea regarding range of aligners required   
+    for your case so that you can have rough estimate to quote to your patient before 
+    proceeding for next step) 
+2. Intraoral Scan / PVS Impression 
+3. OPG (Mandatory) 
+4. Lateral Cephalohram / CBCT (if required our 3D Align Team will contact you for the same) 
+
+Note :- 
+Prior to Intraoral Scanning / Impression taking we recommend you to execute and confirm with our 3D Align Team : 
+Scaling & Polishing 
+Restorations
+Prosthetic Replacements
+Disimpaction / Teeth Removal
+Interproximal Reduction (as directed by our 3D Align team) 
+
+This recommendation criteria is enforced in order to have better aligner fit and to avoid any discrepancies during ongoing aligner treatment which might affect the results. If not executed as directed by 3D Align team than treating dentist would be responsible for the same. 
+To Proceed Further share the Images
 """
-            print(f"Transitioned to 'awaiting_images' stage. Bot response: {bot_response}")
-        elif 'track_case' in session['app_state']:
-            bot_response = "Please provide the case ID or patient name you'd like to track."
-            session['current_stage'] = 'tracking_case'
-            print(f"Transitioned to 'tracking_case' stage. Bot response: {bot_response}")
-        elif session['app_state'] == 'none':
-            bot_response = llm.invoke(message_body).content
-    # --- Awaiting Images Stage ---
+        elif 'other' in session['app_state'] :
+            bot_response = "Please choose one of the following options or you would like to do something else ?"
+            
     elif session['current_stage'] == 'awaiting_images':
         print("Processing in 'awaiting_images' stage...")
         if num_media > 0:
@@ -577,20 +637,20 @@ Kindly share clear images of the patient's case so we can prepare an accurate qu
                 print(f"Transitioned to 'scheduling_quote_confirm'. Bot response: {bot_response}")
             else:
                 bot_response = "You haven't sent any images yet. Please send images to proceed further"
-                print(f"Bot response: {bot_response}")
         else:
-             bot_response = "You haven't sent any images yet. Please send images to proceed further"
-             print(f"Bot response: {bot_response}")
+             bot_response = "You haven't sent any images yet. Please send images to proceed further or would you like to do something else ?"
 
     elif session["current_stage"] == 'awaiting_quote':
-        bot_response = f"Based on the images you provided, the quotation is {3}, please let us know once the patient agrees to it?"
-        session['current_stage'] = 'scheduling_quote_confirm'
-        session['last_question'] = bot_response
+        if session[session["active"]]["quote"] != "...":
+            bot_response = f"Based on the images you provided, the quotation is {session[session['active']]['quote']}, please let us know once the patient agrees to it?"
+            session['current_stage'] = 'scheduling_quote_confirm'
+            session['last_question'] = bot_response
+        else:
+            bot_response = "We are still reviewing the quote will get back to you shortly, till then woudl you like to do anything else perhap submit an another case or track an existing case"
 
     # --- Scheduling Stage (after "submit_case" intent and images received) ---
     elif session['current_stage'] == 'scheduling_quote_confirm':
         print("Processing in 'scheduling_quote_confirm' stage...")
-
         try:
             confirmation_response = confirm_chain.invoke({"input": message_body, "question": session['last_question']})
             session['last_question'] = None
@@ -662,6 +722,7 @@ Your task:
             root_ref.child('namebook').child(session['active']).set(get_name)
             message_body = "Hi"
             session['current_stage'] = 'scheduling_appointment'
+
     if session['current_stage'] == 'scheduling_appointment':
         print("Processing in 'scheduling_appointment' stage...")
         sched_prompt = hub.pull("hwchase17/structured-chat-agent")+"""
@@ -708,7 +769,7 @@ If the user confirms:
 
   - If the location is GPS coordinates, convert it to:
     `https://maps.google.com/?q=<latitude>,<longitude>`
-  - After successfully booking appointment say thank you and ask if they need anything else politely
+  - After successfully booking appointment input_action for final answer must be the appointment's scheduled -> Date,Time,Location_URL,True
 
 ---
 
@@ -734,10 +795,23 @@ Rules:
         # The first message to this agent will be from the user, following the bot's "Great! Let's schedule..." message
         # The agent will then use its instructions (in sched_initial_message) to ask for time and location.
         try:
-            response = sched_executor.invoke({"input": message_body})
-            bot_response = response["output"]
-            print(f"Scheduling agent raw response: {response}")
-            print(f"Scheduling stage bot_response: {bot_response}")
+            response = sched_executor.invoke({"input": message_body})["output"]
+            if response.strip().split(',')[-1] == "True":
+                bot_response = f"""This is to inform you that Intraoral Scan booked for 
+
+Patient Name :- {session[session['active']]['name']}
+
+Date :- {response.strip().split(',')[0]}
+Time :-{response.strip().split(',')[1]}
+Location :- {response.strip().split(',')[2]}
+
+Please Note :-
+Any changes in intraoral scan schedule has to be made 24 hours prior or else scan cancellation charges would be levied as applicable. 
+No Cancellation charges if intimated 24 hours prior. 
+Intraoral Scan once taken will be consider to go for aligner treatment plan simulation and simulation charges would be levied as applicable. In case of any query please feel free to contact."""
+        
+            else:
+                bot_response =response
         except Exception as e:
             print(f"Error during scheduling agent invocation: {e}")
             bot_response = "An error occurred during scheduling. Please try again."
@@ -888,9 +962,9 @@ if __name__ == "__main__":
         print("   Media forwarding will likely FAIL as Twilio cannot access localhost.")
         print("   Please run ngrok (e.g., `ngrok http 5000`) and set NGROK_URL in your .env file")
         print("   to the HTTPS URL ngrok provides (e.g., https://xxxxxxxxxxxx.ngrok-free.app).\n")
-    manual_test = False
+    manual_test = True
     while manual_test:
-        sender_id = "whatsapp:+917801833800"
+        sender_id = "whatsapp:+917801833884"
         num_media = 0
         media_urls =[]
         session = user_sessions_fb.child(sender_id).get()
