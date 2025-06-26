@@ -37,7 +37,7 @@ from langchain_core.outputs import ChatResult
 from langchain_core.messages import BaseMessage
 from typing import List
 import re
-
+import prod_workflow
 class NoThinkLLMWrapper(BaseChatModel):
     wrapped_llm: BaseChatModel
 
@@ -904,7 +904,42 @@ In case if the case has to be delivered on urgent basis please intimate to us pr
                 bot_response = "congo"
             else :
                 bot_response = f"your case for {session[session['active']]['name']} is still under processing"
-            
+        # In server.py, inside the handle_bot_logic function
+
+        # ... (existing elif blocks for other stages) ...
+    elif session['current_stage'] == 'awaiting_fit_confirmation':
+        print("Processing in 'awaiting_fit_confirmation' stage...")
+
+        case_id = session.get('active_case_for_confirmation')
+        if not case_id:
+            bot_response = "I'm sorry, I seem to have lost track of which case we were discussing. A team member will get in touch."
+            session['current_stage'] = 'intent'
+            # You might want to alert your team here as well
+        else:
+            # Retrieve case details from Firebase
+            case_data = root_ref.child('cases').child(case_id).get()
+            patient_name = case_data.get('name', 'the patient') if case_data else 'the patient'
+
+            # Use the confirm_chain to interpret the Yes/No response
+            last_question = f"Should we go ahead with the fabrication for patient {patient_name}?"
+            confirmation = confirm_chain.invoke({"input": message_body, "question": last_question})
+            print(f"Fit confirmation from dentist: '{confirmation}'")
+
+            if 'yes' in confirmation.lower():
+                bot_response = "Thank you for the confirmation! We will now proceed with the fabrication of the remaining aligner sets."
+                # Trigger the next step in the production workflow
+                production_logic.start_full_case_fabrication(user_id, case_id, patient_name)
+                session['current_stage'] = 'intent'  # Reset state
+
+            elif 'no' in confirmation.lower():
+                bot_response = "Thank you for your feedback. A member of our clinical team will contact you shortly to troubleshoot the issue."
+                # Alert the internal team about the problem
+                production_logic.alert_team_on_fit_issue(user_id, case_id, patient_name, message_body)
+                session['current_stage'] = 'intent'  # Reset state
+
+            else:
+                bot_response = "I'm sorry, I didn't quite understand. Does the training aligner fit correctly? Please respond with 'Yes' or 'No'."
+                # The stage remains 'awaiting_fit_confirmation' to prompt the user again
 
 
     # ... (The rest of the stages and the Flask routes remain the same) ...
@@ -945,7 +980,7 @@ from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 import requests
 import os
-@app.route("/whatsapp", methods=["POST"])
+@app.route("/whatsapp"  , methods=["POST"])
 def whatsapp_webhook():
     """
     Twilio webhook endpoint for incoming WhatsApp messages.
