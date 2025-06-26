@@ -1,4 +1,4 @@
-# production_logic.py
+# production_engine.py
 
 import os
 from dotenv import load_dotenv
@@ -7,7 +7,7 @@ import firebase_admin
 from firebase_admin import db
 
 # ==============================================================================
-# 1. INITIALIZATION
+# 1. INITIALIZATION & CONFIGURATION
 # ==============================================================================
 load_dotenv(override=True)
 
@@ -22,224 +22,117 @@ if not firebase_admin._apps:
     FIREBASE_DATABASE_URL = "https://diesel-ellipse-463111-a5-default-rtdb.asia-southeast1.firebasedatabase.app/"
     firebase_admin.initialize_app(options={'databaseURL': FIREBASE_DATABASE_URL})
 
-# --- Service Clients ---
+# --- Service Clients & DB References ---
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 db_root = db.reference('/')
+# IMPORTANT: We assume a structure like /cases/{case_id}
 cases_ref = db_root.child('cases')
 user_sessions_ref = db_root.child('user_sessions')
 
 # ==============================================================================
-# 2. MESSAGE TEMPLATES (From PDF)
+# 2. MESSAGE TEMPLATES (FROM PDF)
 # ==============================================================================
-
-# Aligner Fabrication Message (Page 9)
-ALIGNER_FABRICATION_MSG = """Dear Doctor,
-Greetings !!!
-
-This is to inform you that the process of Aligner Fabrication has been initiated for your case.
-
-Patient Name :- {patient_name}
-
-Dispatch details will soon be provided to you.
-
-Regards...
-Team - 3D Align"""
-
-# Dispatch Details Message (Page 10)
-DISPATCH_DETAILS_MSG = """Dear Doctor,
-Greetings !!!
-
-Thank you for your valuable support.
-
-Please take a note of details of your shipment :-
-
-Patient Name :- {patient_name}
-Consignment Items :- {consignment_items}
-Tracking ID :- {tracking_id}
-Tracking Site :- {tracking_site}
-
-In case if shipment is not delivered to you within 2-4 days of dispatch than please revert back to us.
-
-Regards...
-Team - 3D Align"""
-
-# Training Aligner Fit Confirmation Message (Page 8)
-TRAINING_ALIGNER_FIT_CONFIRM_MSG = """Dear Doctor,
-Greetings !!!
-
-We would like to know the fit of training aligner sent to you for
-Patient Name :- {patient_name}
-
-Also please let us know whether we should go ahead for the fabrication of remaining sets of aligner ?
-
-Please Note :-
-Remaining sets of aligner will be dispatched within a week upon confirmation received for the case.
-
-Regards...
-Team - 3D Align"""
+# (These are the same as before, collected here for clarity)
+ALIGNER_FABRICATION_MSG = """Dear Doctor,\nGreetings !!!\n\nThis is to inform you that the process of Aligner Fabrication has been initiated for your case.\n\nPatient Name :- {patient_name}\n\nDispatch details will soon be provided to you.\n\nRegards...\nTeam - 3D Align"""
+DISPATCH_DETAILS_MSG = """Dear Doctor,\nGreetings !!!\n\nThank you for your valuable support.\n\nPlease take a note of details of your shipment :-\n\nPatient Name :- {patient_name}\nConsignment Items :- {consignment_items}\nTracking ID :- {tracking_id}\nTracking Site :- {tracking_site}\n\nIn case if shipment is not delivered to you within 2-4 days of dispatch than please revert back to us.\n\nRegards...\nTeam - 3D Align"""
+TRAINING_ALIGNER_FIT_CONFIRM_MSG = """Dear Doctor,\nGreetings !!!\n\nWe would like to know the fit of training aligner sent to you for\nPatient Name :- {patient_name}\n\nAlso please let us know whether we should go ahead for the fabrication of remaining sets of aligner ?\n\nPlease Note :-\nRemaining sets of aligner will be dispatched within a week upon confirmation received for the case.\n\nRegards...\nTeam - 3D Align"""
 
 
 # ==============================================================================
-# 3. PRODUCTION WORKFLOW FUNCTIONS
+# 3. THE SINGULAR WORKFLOW ENGINE FUNCTION
 # ==============================================================================
 
-def start_case_planning(user_id: str, case_id: str, patient_name: str):
+def advance_production_workflow(case_id: str, **kwargs):
     """
-    Step 1: Intimates the dentist that case planning has begun.
-    - user_id: The dentist's WhatsApp ID (e.g., 'whatsapp:+91...')
-    - case_id: The unique ID for the case.
-    - patient_name: The name of the patient.
+    Advances a case to its next logical step in the production workflow.
+    This is the main function your internal system will call.
+
+    Args:
+        case_id (str): The unique ID of the case to process.
+        **kwargs: Optional arguments needed for specific steps, e.g.,
+                  tracking_id="...", tracking_site="..."
+
+    Returns:
+        str: A message indicating the action taken or the current status.
     """
-    try:
+    print(f"\n--- Advancing workflow for Case ID: {case_id} ---")
+
+    # 1. Fetch case data from Firebase
+    case_data = cases_ref.child(case_id).get()
+    if not case_data:
+        return f"ERROR: Case ID '{case_id}' not found in Firebase."
+
+    current_status = case_data.get('status', 'new')
+    user_id = case_data.get('user_id')  # Assumes user_id is stored in the case
+    patient_name = case_data.get('name')
+
+    if not all([user_id, patient_name]):
+        return f"ERROR: Case '{case_id}' is missing 'user_id' or 'name' in Firebase."
+
+    print(f"Current status: '{current_status}'")
+
+    # 2. State Machine Logic (if/elif based on current status)
+
+    # === INITIAL STEP ===
+    if current_status == 'ApprovedForProduction':
         message_body = f"Dear Doctor, planning for patient '{patient_name}' (Case ID: {case_id}) has started. We will keep you updated."
-
-        twilio_client.messages.create(
-            from_=TWILIO_WHATSAPP_NUMBER,
-            to=user_id,
-            body=message_body
-        )
-
-        # Update case status in Firebase
+        twilio_client.messages.create(to=user_id, from_=TWILIO_WHATSAPP_NUMBER, body=message_body)
         cases_ref.child(case_id).update({'status': 'CasePlanning'})
-        print(f"Successfully sent 'Case Planning' intimation for case {case_id} to {user_id}.")
-        return True
-    except Exception as e:
-        print(f"ERROR in start_case_planning for case {case_id}: {e}")
-        return False
+        return f"Action: Sent 'Case Planning' notification to {user_id}. Status updated to 'CasePlanning'."
 
+    # === STEP AFTER PLANNING ===
+    elif current_status == 'CasePlanning':
+        tracking_id = kwargs.get('tracking_id')
+        tracking_site = kwargs.get('tracking_site')
+        if not all([tracking_id, tracking_site]):
+            return f"ERROR: For status 'CasePlanning', you must provide 'tracking_id' and 'tracking_site' for the training aligner."
 
-def dispatch_training_aligner(user_id: str, case_id: str, patient_name: str, tracking_id: str, tracking_site: str):
-    """
-    Step 2: Dispatches the training aligner and asks the dentist for fit confirmation.
-    """
-    try:
-        # First, send the dispatch details for the training aligner
-        dispatch_message = DISPATCH_DETAILS_MSG.format(
-            patient_name=patient_name,
-            consignment_items="Training Aligner Set",
-            tracking_id=tracking_id,
-            tracking_site=tracking_site
-        )
-        twilio_client.messages.create(
-            from_=TWILIO_WHATSAPP_NUMBER,
-            to=user_id,
-            body=dispatch_message
-        )
-        print(f"Sent 'Training Aligner Dispatch Details' for case {case_id} to {user_id}.")
+        # Send dispatch details
+        dispatch_message = DISPATCH_DETAILS_MSG.format(patient_name=patient_name,
+                                                       consignment_items="Training Aligner Set",
+                                                       tracking_id=tracking_id, tracking_site=tracking_site)
+        twilio_client.messages.create(to=user_id, from_=TWILIO_WHATSAPP_NUMBER, body=dispatch_message)
 
-        # Second, send the fit confirmation request message
+        # Send fit confirmation request
         fit_confirm_message = TRAINING_ALIGNER_FIT_CONFIRM_MSG.format(patient_name=patient_name)
-        twilio_client.messages.create(
-            from_=TWILIO_WHATSAPP_NUMBER,
-            to=user_id,
-            body=fit_confirm_message
-        )
-        print(f"Sent 'Training Aligner Fit Confirmation Request' for case {case_id} to {user_id}.")
+        twilio_client.messages.create(to=user_id, from_=TWILIO_WHATSAPP_NUMBER, body=fit_confirm_message)
 
-        # Update Firebase state
-        cases_ref.child(case_id).update({
-            'status': 'AwaitingFitConfirmation',
-            'tracking_id_training': tracking_id
-        })
-        user_sessions_ref.child(user_id).update({
-            'current_stage': 'awaiting_fit_confirmation',
-            'active_case_for_confirmation': case_id  # Critical for the webhook to know which case this is for
-        })
+        # Update case and user states
+        cases_ref.child(case_id).update({'status': 'TrainingAlignerDispatched', 'tracking_id_training': tracking_id})
+        user_sessions_ref.child(user_id).update(
+            {'current_stage': 'awaiting_fit_confirmation', 'active_case_for_confirmation': case_id})
+        return f"Action: Dispatched training aligner for case {case_id}. Waiting for dentist fit confirmation."
 
-        print(f"Successfully updated status for case {case_id} and user {user_id} to 'awaiting_fit_confirmation'.")
-        return True
-    except Exception as e:
-        print(f"ERROR in dispatch_training_aligner for case {case_id}: {e}")
-        return False
-
-
-def start_full_case_fabrication(user_id: str, case_id: str, patient_name: str):
-    """
-    Step 3: Called after dentist confirms fit. Intimates that main fabrication has started.
-    """
-    try:
+    # === STEP AFTER DENTIST CONFIRMS FIT ===
+    elif current_status == 'FitConfirmed':
         message_body = ALIGNER_FABRICATION_MSG.format(patient_name=patient_name)
-
-        twilio_client.messages.create(
-            from_=TWILIO_WHATSAPP_NUMBER,
-            to=user_id,
-            body=message_body
-        )
-
-        # Update case status and clear user's waiting stage
+        twilio_client.messages.create(to=user_id, from_=TWILIO_WHATSAPP_NUMBER, body=message_body)
         cases_ref.child(case_id).update({'status': 'FullCaseFabrication'})
-        user_sessions_ref.child(user_id).update({
-            'current_stage': 'intent',  # Reset user to a neutral state
-            'active_case_for_confirmation': None
-        })
+        return f"Action: Sent 'Full Fabrication' notification to {user_id}. Status updated to 'FullCaseFabrication'."
 
-        print(f"Successfully sent 'Full Case Fabrication' intimation for case {case_id} to {user_id}.")
-        return True
-    except Exception as e:
-        print(f"ERROR in start_full_case_fabrication for case {case_id}: {e}")
-        return False
+    # === STEP AFTER FULL FABRICATION ===
+    elif current_status == 'FullCaseFabrication':
+        tracking_id = kwargs.get('tracking_id')
+        tracking_site = kwargs.get('tracking_site')
+        consignment_items = kwargs.get('consignment_items', 'Full Aligner Set')
+        if not all([tracking_id, tracking_site]):
+            return f"ERROR: For status 'FullCaseFabrication', you must provide 'tracking_id' and 'tracking_site' for the final dispatch."
 
+        message_body = DISPATCH_DETAILS_MSG.format(patient_name=patient_name, consignment_items=consignment_items,
+                                                   tracking_id=tracking_id, tracking_site=tracking_site)
+        twilio_client.messages.create(to=user_id, from_=TWILIO_WHATSAPP_NUMBER, body=message_body)
+        cases_ref.child(case_id).update({'status': 'Completed', 'tracking_id_final': tracking_id})
+        return f"Action: Dispatched full case for case {case_id}. Status updated to 'Completed'."
 
-def dispatch_full_case(user_id: str, case_id: str, patient_name: str, consignment_items: str, tracking_id: str,
-                       tracking_site: str):
-    """
-    Step 4: Dispatches the full set of aligners and provides final tracking details.
-    """
-    try:
-        message_body = DISPATCH_DETAILS_MSG.format(
-            patient_name=patient_name,
-            consignment_items=consignment_items,
-            tracking_id=tracking_id,
-            tracking_site=tracking_site
-        )
+    # === WAITING OR END STATES ===
+    elif current_status == 'TrainingAlignerDispatched':
+        return "Info: Case is currently waiting for the dentist to confirm the training aligner fit. No action taken."
 
-        twilio_client.messages.create(
-            from_=TWILIO_WHATSAPP_NUMBER,
-            to=user_id,
-            body=message_body
-        )
+    elif current_status == 'FitIssueReported':
+        return "Info: Dentist reported a fit issue. Case requires manual intervention. No action taken."
 
-        # Update case status to final state
-        cases_ref.child(case_id).update({
-            'status': 'CompletedAndDispatched',
-            'tracking_id_final': tracking_id
-        })
+    elif current_status == 'Completed':
+        return "Info: This case has already been completed. No further action can be taken."
 
-        print(f"Successfully sent 'Full Case Dispatch' details for case {case_id} to {user_id}.")
-        return True
-    except Exception as e:
-        print(f"ERROR in dispatch_full_case for case {case_id}: {e}")
-        return False
-
-
-def alert_team_on_fit_issue(user_id: str, case_id: str, patient_name: str, dentist_message: str):
-    """
-    Alerts the internal team if the dentist reports a fit issue.
-    """
-    try:
-        alert_body = (
-            f"🚨 FIT ISSUE ALERT 🚨\n\n"
-            f"Dentist: {user_id}\n"
-            f"Case ID: {case_id}\n"
-            f"Patient: {patient_name}\n\n"
-            f"Dentist's Message: '{dentist_message}'\n\n"
-            f"Please contact the dentist immediately to resolve the issue."
-        )
-
-        twilio_client.messages.create(
-            from_=TWILIO_WHATSAPP_NUMBER,
-            to=FORWARD_TO_WHATSAPP_NUMBER,  # Sending to internal team number
-            body=alert_body
-        )
-
-        # Update case status and clear user's waiting stage
-        cases_ref.child(case_id).update({'status': 'FitIssueReported'})
-        user_sessions_ref.child(user_id).update({
-            'current_stage': 'intent',
-            'active_case_for_confirmation': None
-        })
-        print(f"Successfully alerted team about fit issue for case {case_id}.")
-        return True
-    except Exception as e:
-        print(f"ERROR in alert_team_on_fit_issue for case {case_id}: {e}")
-        return False
+    else:
+        return f"Warning: Case '{case_id}' has an unknown status: '{current_status}'. No action taken."
