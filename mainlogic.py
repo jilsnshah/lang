@@ -36,7 +36,7 @@ from langchain_openai import ChatOpenAI
 # ==============================================================================
 # 2. CONFIGURATION AND INITIALIZATION
 # ==============================================================================
-load_dotenv()
+load_dotenv(override=True)
 
 # --- Configuration Constants ---
 CLIENT_SECRET_FILE = 'client_secret.json'
@@ -149,7 +149,7 @@ def get_or_create_folder(service, name, parent_id):
 from googleapiclient.http import MediaFileUpload
 # Assuming get_drive and get_or_create_folder are defined elsewhere and work correctly
 
-def upload_drive(file_path, file_name, mime_type, doc_name, patient_name):
+def upload_drive(file_path, file_name, mime_type, doc_name, patient_name, label):
     """
     Uploads a file to Google Drive and returns its direct download link.
     """
@@ -163,7 +163,7 @@ def upload_drive(file_path, file_name, mime_type, doc_name, patient_name):
         root_folder_id = get_or_create_folder(drive_service, '3d-align', 'root')
         doc_folder_id = get_or_create_folder(drive_service, doc_name, root_folder_id)
         patient_folder_id = get_or_create_folder(drive_service, patient_name, doc_folder_id)
-        img_folder_id = get_or_create_folder(drive_service, 'img', patient_folder_id)
+        img_folder_id = get_or_create_folder(drive_service, label, patient_folder_id)
 
         file_metadata = {'name': file_name, 'parents': [img_folder_id]}
         media = MediaFileUpload(file_path, mimetype=mime_type, resumable=True)
@@ -271,7 +271,7 @@ def sl(serializable_messages_list):
 # ==============================================================================
 # 4. TOOL DEFINITIONS
 # ==============================================================================
-def create_tools(calendar_service):
+def create_tools(calendar_service =get_calendar_service_oauth()):
     """Creates all the necessary tools for the agents."""
 
     # --- Tool Functions ---
@@ -356,9 +356,6 @@ def create_tools(calendar_service):
             return f"Failed to check calendar due to a Google API error: {e}"
         except Exception as e:
             return f"An unexpected error occurred during calendar check: {e}"
-
-    def confirm_appointment_and_exit(*args, **kwargs):
-        """Sets the exit flag when an appointment is confirmed."""
 
 
    
