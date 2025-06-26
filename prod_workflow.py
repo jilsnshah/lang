@@ -1,138 +1,314 @@
-# production_engine.py
+# production_workflow.py
+# FINAL, REFACTORED VERSION
+# A clean, single-file implementation of the production workflow,
+# refactored to be easily importable and testable.
 
+import time
+import json
 import os
+import requests
 from dotenv import load_dotenv
-from twilio.rest import Client
-import firebase_admin
-from firebase_admin import db
+from typing import Any, List, Optional, Mapping, Callable
 
-# ==============================================================================
-# 1. INITIALIZATION & CONFIGURATION
-# ==============================================================================
-load_dotenv(override=True)
-
-# --- Twilio Configuration ---
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
-FORWARD_TO_WHATSAPP_NUMBER = os.getenv("FORWARD_TO_WHATSAPP_NUMBER")  # For internal alerts
-
-# --- Firebase Initialization Check ---
-if not firebase_admin._apps:
-    FIREBASE_DATABASE_URL = "https://diesel-ellipse-463111-a5-default-rtdb.asia-southeast1.firebasedatabase.app/"
-    firebase_admin.initialize_app(options={'databaseURL': FIREBASE_DATABASE_URL})
-
-# --- Service Clients & DB References ---
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-db_root = db.reference('/')
-# IMPORTANT: We assume a structure like /cases/{case_id}
-cases_ref = db_root.child('cases')
-user_sessions_ref = db_root.child('user_sessions')
-
-# ==============================================================================
-# 2. MESSAGE TEMPLATES (FROM PDF)
-# ==============================================================================
-# (These are the same as before, collected here for clarity)
-ALIGNER_FABRICATION_MSG = """Dear Doctor,\nGreetings !!!\n\nThis is to inform you that the process of Aligner Fabrication has been initiated for your case.\n\nPatient Name :- {patient_name}\n\nDispatch details will soon be provided to you.\n\nRegards...\nTeam - 3D Align"""
-DISPATCH_DETAILS_MSG = """Dear Doctor,\nGreetings !!!\n\nThank you for your valuable support.\n\nPlease take a note of details of your shipment :-\n\nPatient Name :- {patient_name}\nConsignment Items :- {consignment_items}\nTracking ID :- {tracking_id}\nTracking Site :- {tracking_site}\n\nIn case if shipment is not delivered to you within 2-4 days of dispatch than please revert back to us.\n\nRegards...\nTeam - 3D Align"""
-TRAINING_ALIGNER_FIT_CONFIRM_MSG = """Dear Doctor,\nGreetings !!!\n\nWe would like to know the fit of training aligner sent to you for\nPatient Name :- {patient_name}\n\nAlso please let us know whether we should go ahead for the fabrication of remaining sets of aligner ?\n\nPlease Note :-\nRemaining sets of aligner will be dispatched within a week upon confirmation received for the case.\n\nRegards...\nTeam - 3D Align"""
+from langchain_core.language_models.llms import LLM
+from langchain_core.callbacks.manager import CallbackManagerForLLMRun
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
 
 
 # ==============================================================================
-# 3. THE SINGULAR WORKFLOW ENGINE FUNCTION
+# SECTION 1: CORE LOGIC & SERVICE PLACEHOLDERS
 # ==============================================================================
 
-def advance_production_workflow(case_id: str, **kwargs):
-    """
-    Advances a case to its next logical step in the production workflow.
-    This is the main function your internal system will call.
+# --- Service Placeholders (TODO: Implement these with your real services) ---
 
-    Args:
-        case_id (str): The unique ID of the case to process.
-        **kwargs: Optional arguments needed for specific steps, e.g.,
-                  tracking_id="...", tracking_site="..."
+def send_whatsapp_message(user_id: str, message: str):
+    """PLACEHOLDER: Sends a message via a real service like Twilio."""
+    print("\n" + "=" * 60)
+    print(f"✅ [SENDING WHATSAPP TO: {user_id}]")
+    print(f"MESSAGE:\n{message}")
+    print("=" * 60)
 
-    Returns:
-        str: A message indicating the action taken or the current status.
-    """
-    print(f"\n--- Advancing workflow for Case ID: {case_id} ---")
 
-    # 1. Fetch case data from Firebase
-    case_data = cases_ref.child(case_id).get()
+def get_case_from_db_real(case_id: str) -> dict:
+    """PLACEHOLDER: Gets case data from a real database like Firebase."""
+    raise NotImplementedError("This function should be implemented with a real database call.")
+
+
+def update_case_in_db_real(case_id: str, updates: dict):
+    """PLACEHOLDER: Updates a case in a real database like Firebase."""
+    raise NotImplementedError("This function should be implemented with a real database call.")
+
+
+def get_user_session_from_db_real(user_id: str) -> dict:
+    """PLACEHOLDER: Gets a user's session from a real database like Firebase."""
+    raise NotImplementedError("This function should be implemented with a real database call.")
+
+
+def update_user_session_in_db_real(user_id: str, updates: dict):
+    """PLACEHOLDER: Updates a user's session in a real database like Firebase."""
+    raise NotImplementedError("This function should be implemented with a real database call.")
+
+
+# --- LLM Setup ---
+
+class CustomOpenRouterLLM(LLM):
+    """Your custom LLM class for OpenRouter."""
+    n: int
+    model_to_use: str = "deepseek/deepseek-r1-0528:free"
+
+    @property
+    def _llm_type(self) -> str:
+        return "custom_openrouter_llm"
+
+    def _call(
+            self, prompt: str, stop: Optional[List[str]] = None,
+            run_manager: Optional[CallbackManagerForLLMRun] = None, **kwargs: Any
+    ) -> str:
+        api_key = os.getenv('OPENROUTER_API_KEY')
+        if not api_key: raise ValueError("OPENROUTER_API_KEY not found.")
+        headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
+        data = {'model': self.model_to_use, 'messages': [{'role': 'user', 'content': prompt}]}
+        try:
+            response = requests.post('https://openrouter.ai/api/v1/chat/completions', headers=headers, json=data)
+            response.raise_for_status()
+            return response.json()['choices'][0]['message']['content']
+        except (requests.exceptions.RequestException, KeyError, IndexError) as e:
+            raise ValueError(f"API call or parsing failed: {e}")
+
+    @property
+    def _identifying_params(self) -> Mapping[str, Any]:
+        return {"n": self.n, "model_name": self.model_to_use}
+
+
+# --- Core Workflow Functions (Refactored for Dependency Injection) ---
+
+def start_production_step(
+        case_id: str,
+        get_case_from_db: Callable,
+        update_case_in_db: Callable,
+        update_user_session_in_db: Callable
+):
+    """Main engine function. It now accepts database functions as arguments."""
+    case_data = get_case_from_db(case_id)
     if not case_data:
-        return f"ERROR: Case ID '{case_id}' not found in Firebase."
+        print(f"[ENGINE-ERROR] Case '{case_id}' not found.")
+        return
 
-    current_status = case_data.get('status', 'new')
-    user_id = case_data.get('user_id')  # Assumes user_id is stored in the case
-    patient_name = case_data.get('name')
+    status = case_data.get("status")
+    user_id = case_data.get("user_id")
+    patient_name = case_data.get("patient_name")
+    print(f"\n[ENGINE] Advancing case '{case_id}'. Current status: '{status}'")
 
-    if not all([user_id, patient_name]):
-        return f"ERROR: Case '{case_id}' is missing 'user_id' or 'name' in Firebase."
+    if status == "ApprovedForProduction":
+        send_whatsapp_message(user_id, f"Dear Doctor, planning for patient '{patient_name}' has started.")
+        update_case_in_db(case_id, {"status": "CasePlanningComplete"})
+        print("➡️  [ENGINE] New status: CasePlanningComplete")
 
-    print(f"Current status: '{current_status}'")
+    elif status == "CasePlanningComplete":
+        send_whatsapp_message(user_id,
+                              f"Dear Doctor,\nThe training aligner for patient '{patient_name}' has been dispatched. Please confirm the fit once received.")
+        update_case_in_db(case_id, {"status": "AwaitingFitConfirmation"})
+        update_user_session_in_db(user_id, {"current_stage": "awaiting_fit_confirmation", "active_case": case_id})
+        print("➡️  [ENGINE] New status: AwaitingFitConfirmation. Waiting for dentist reply.")
 
-    # 2. State Machine Logic (if/elif based on current status)
+    elif status == "FitConfirmed_PhaseWise":
+        send_whatsapp_message(user_id,
+                              f"Thank you. The first phase of aligners for '{patient_name}' is being prepared for dispatch.")
+        update_case_in_db(case_id, {"status": "Dispatching_PhaseWise"})
+        print("➡️  [ENGINE] New status: Dispatching_PhaseWise")
 
-    # === INITIAL STEP ===
-    if current_status == 'ApprovedForProduction':
-        message_body = f"Dear Doctor, planning for patient '{patient_name}' (Case ID: {case_id}) has started. We will keep you updated."
-        twilio_client.messages.create(to=user_id, from_=TWILIO_WHATSAPP_NUMBER, body=message_body)
-        cases_ref.child(case_id).update({'status': 'CasePlanning'})
-        return f"Action: Sent 'Case Planning' notification to {user_id}. Status updated to 'CasePlanning'."
-
-    # === STEP AFTER PLANNING ===
-    elif current_status == 'CasePlanning':
-        tracking_id = kwargs.get('tracking_id')
-        tracking_site = kwargs.get('tracking_site')
-        if not all([tracking_id, tracking_site]):
-            return f"ERROR: For status 'CasePlanning', you must provide 'tracking_id' and 'tracking_site' for the training aligner."
-
-        # Send dispatch details
-        dispatch_message = DISPATCH_DETAILS_MSG.format(patient_name=patient_name,
-                                                       consignment_items="Training Aligner Set",
-                                                       tracking_id=tracking_id, tracking_site=tracking_site)
-        twilio_client.messages.create(to=user_id, from_=TWILIO_WHATSAPP_NUMBER, body=dispatch_message)
-
-        # Send fit confirmation request
-        fit_confirm_message = TRAINING_ALIGNER_FIT_CONFIRM_MSG.format(patient_name=patient_name)
-        twilio_client.messages.create(to=user_id, from_=TWILIO_WHATSAPP_NUMBER, body=fit_confirm_message)
-
-        # Update case and user states
-        cases_ref.child(case_id).update({'status': 'TrainingAlignerDispatched', 'tracking_id_training': tracking_id})
-        user_sessions_ref.child(user_id).update(
-            {'current_stage': 'awaiting_fit_confirmation', 'active_case_for_confirmation': case_id})
-        return f"Action: Dispatched training aligner for case {case_id}. Waiting for dentist fit confirmation."
-
-    # === STEP AFTER DENTIST CONFIRMS FIT ===
-    elif current_status == 'FitConfirmed':
-        message_body = ALIGNER_FABRICATION_MSG.format(patient_name=patient_name)
-        twilio_client.messages.create(to=user_id, from_=TWILIO_WHATSAPP_NUMBER, body=message_body)
-        cases_ref.child(case_id).update({'status': 'FullCaseFabrication'})
-        return f"Action: Sent 'Full Fabrication' notification to {user_id}. Status updated to 'FullCaseFabrication'."
-
-    # === STEP AFTER FULL FABRICATION ===
-    elif current_status == 'FullCaseFabrication':
-        tracking_id = kwargs.get('tracking_id')
-        tracking_site = kwargs.get('tracking_site')
-        consignment_items = kwargs.get('consignment_items', 'Full Aligner Set')
-        if not all([tracking_id, tracking_site]):
-            return f"ERROR: For status 'FullCaseFabrication', you must provide 'tracking_id' and 'tracking_site' for the final dispatch."
-
-        message_body = DISPATCH_DETAILS_MSG.format(patient_name=patient_name, consignment_items=consignment_items,
-                                                   tracking_id=tracking_id, tracking_site=tracking_site)
-        twilio_client.messages.create(to=user_id, from_=TWILIO_WHATSAPP_NUMBER, body=message_body)
-        cases_ref.child(case_id).update({'status': 'Completed', 'tracking_id_final': tracking_id})
-        return f"Action: Dispatched full case for case {case_id}. Status updated to 'Completed'."
-
-    # === WAITING OR END STATES ===
-    elif current_status == 'TrainingAlignerDispatched':
-        return "Info: Case is currently waiting for the dentist to confirm the training aligner fit. No action taken."
-
-    elif current_status == 'FitIssueReported':
-        return "Info: Dentist reported a fit issue. Case requires manual intervention. No action taken."
-
-    elif current_status == 'Completed':
-        return "Info: This case has already been completed. No further action can be taken."
-
+    elif status == "FitConfirmed_FullCase":
+        send_whatsapp_message(user_id,
+                              f"Thank you. The full set of aligners for '{patient_name}' is being prepared for dispatch.")
+        update_case_in_db(case_id, {"status": "Dispatching_FullCase"})
+        print("➡️  [ENGINE] New status: Dispatching_FullCase")
     else:
-        return f"Warning: Case '{case_id}' has an unknown status: '{current_status}'. No action taken."
+        print(f"[ENGINE] Info: No automated action for status '{status}'.")
+
+
+def handle_dentist_reply(
+        user_id: str,
+        message_body: str,
+        llm_chain: LLMChain,
+        get_user_session_from_db: Callable,
+        update_user_session_in_db: Callable,
+        update_case_in_db: Callable
+):
+    """Handles the dentist's first reply. Accepts DB functions as arguments."""
+    session = get_user_session_from_db(user_id)
+    if session.get("current_stage") != "awaiting_fit_confirmation":
+        print("[CHATBOT] Message ignored (not awaiting confirmation).")
+        return
+
+    case_id = session.get("active_case")
+    print(f"\n[CHATBOT] Dentist replied: '{message_body}'. Calling LLM...")
+
+    try:
+        fit_confirmation = llm_chain.run(user_response=message_body).strip()
+        print(f"[CHATBOT] LLM classified fit confirmation as: '{fit_confirmation}'")
+
+        if "yes" in fit_confirmation.lower():
+            send_whatsapp_message(user_id,
+                                  "Excellent. Would you like the aligners dispatched Phase-Wise or as a Full Case?")
+            update_user_session_in_db(user_id, {"current_stage": "awaiting_dispatch_choice"})
+
+        elif "no" in fit_confirmation.lower():
+            send_whatsapp_message(user_id,
+                                  "Thank you for the feedback. A member of our clinical team will contact you shortly.")
+            update_case_in_db(case_id, {"status": "FitIssueReported"})
+            update_user_session_in_db(user_id, {"current_stage": "general"})
+
+        else:
+            send_whatsapp_message(user_id,
+                                  "I'm sorry, I didn't quite understand. Does the aligner fit correctly? A simple 'yes' or 'no' would be helpful.")
+
+    except Exception as e:
+        print(f"❌ [LLM-ERROR] API call failed: {e}")
+
+
+def handle_dispatch_choice_reply(
+        user_id: str,
+        message_body: str,
+        llm: LLM,
+        get_user_session_from_db: Callable,
+        update_user_session_in_db: Callable,
+        get_case_from_db: Callable,
+        update_case_in_db: Callable
+):
+    """Handles dispatch choice reply. Accepts DB functions and an LLM instance."""
+    session = get_user_session_from_db(user_id)
+    if session.get("current_stage") != "awaiting_dispatch_choice":
+        return
+
+    case_id = session.get("active_case")
+    print(f"\n[CHATBOT] Dentist replied about dispatch choice: '{message_body}'. Calling LLM...")
+
+    choice_prompt = PromptTemplate(
+        input_variables=["user_response"],
+        template="A dentist was asked if they want aligners dispatched 'Phase-Wise' or as a 'Full Case'. Classify their response. Respond with only 'PhaseWise', 'FullCase', or 'Unknown'.\n\nResponse: '{user_response}'\nChoice:"
+    )
+    choice_chain = LLMChain(llm=llm, prompt=choice_prompt)
+
+    try:
+        dispatch_choice = choice_chain.run(user_response=message_body).strip()
+        print(f"[CHATBOT] LLM classified dispatch choice as: '{dispatch_choice}'")
+
+        if "phasewise" in dispatch_choice.lower():
+            update_case_in_db(case_id, {"status": "FitConfirmed_PhaseWise"})
+        elif "fullcase" in dispatch_choice.lower():
+            update_case_in_db(case_id, {"status": "FitConfirmed_FullCase"})
+        else:
+            send_whatsapp_message(user_id,
+                                  "My apologies, I'm not sure which dispatch option you'd prefer. Please reply with 'Phase-Wise' or 'Full Case'.")
+            return
+
+        update_user_session_in_db(user_id, {"current_stage": "general"})
+        # Automatically trigger the next step after the choice is made
+        start_production_step(case_id, get_case_from_db, update_case_in_db, update_user_session_in_db)
+
+    except Exception as e:
+        print(f"❌ [LLM-ERROR] API call failed: {e}")
+
+
+# ==============================================================================
+# SECTION 2: IMPORTABLE TEST FUNCTION
+# ==============================================================================
+
+def run_interactive_test():
+    """
+    This function encapsulates the entire interactive test flow.
+    It creates its own mock database and mock functions, then passes them
+    to the core logic functions to run a self-contained test.
+    """
+    load_dotenv(override=True)
+    if not os.getenv("OPENROUTER_API_KEY"):
+        print("❌ FATAL: OPENROUTER_API_KEY not found in .env file. Cannot run test.")
+        return
+
+    # --- Setup Mock Database for this specific test run ---
+    MOCK_DB = {
+        "cases": {},
+        "user_sessions": {}
+    }
+
+    # --- Define Mock DB functions for this test ---
+    def mock_get_case_from_db(case_id: str) -> dict:
+        return MOCK_DB["cases"].get(case_id, {})
+
+    def mock_update_case_in_db(case_id: str, updates: dict):
+        MOCK_DB["cases"].get(case_id, {}).update(updates)
+
+    def mock_get_user_session_from_db(user_id: str) -> dict:
+        return MOCK_DB["user_sessions"].get(user_id, {})
+
+    def mock_update_user_session_in_db(user_id: str, updates: dict):
+        MOCK_DB["user_sessions"].get(user_id, {}).update(updates)
+
+    # --- Initialize LLM Chain for the test ---
+    llm_instance = CustomOpenRouterLLM(n=1)
+    fit_prompt = PromptTemplate(input_variables=["user_response"],
+                                template="A dentist was asked if a training aligner fits correctly. Classify their response as 'Yes', 'No', or 'Unknown'. Respond with only one word.\n\nResponse: '{user_response}'\nClassification:")
+    fit_confirm_chain = LLMChain(llm=llm_instance, prompt=fit_prompt)
+
+    # --- Automated Test Sequence ---
+    TEST_CASE_ID = "case_simple_123"
+    TEST_USER_ID = "whatsapp_test_user"
+    MOCK_DB["cases"][TEST_CASE_ID] = {"patient_name": "Test Patient", "user_id": TEST_USER_ID,
+                                      "status": "ApprovedForProduction"}
+    MOCK_DB["user_sessions"][TEST_USER_ID] = {"current_stage": "general"}
+
+    print("\n--- STARTING INTERACTIVE WORKFLOW TEST ---")
+    time.sleep(1)
+
+    # 1. Start the process, passing the mock DB functions
+    print("\nSTEP 1: Your backend starts the production for the case.")
+    start_production_step(
+        TEST_CASE_ID,
+        get_case_from_db=mock_get_case_from_db,
+        update_case_in_db=mock_update_case_in_db,
+        update_user_session_in_db=mock_update_user_session_in_db
+    )
+    time.sleep(1)
+
+    # 2. Mark training aligner as dispatched
+    print("\nSTEP 2: Your backend marks the training aligner as dispatched.")
+    start_production_step(
+        TEST_CASE_ID,
+        get_case_from_db=mock_get_case_from_db,
+        update_case_in_db=mock_update_case_in_db,
+        update_user_session_in_db=mock_update_user_session_in_db
+    )
+    time.sleep(1)
+
+    # 3. Simulate dentist replying about the fit
+    print("\nSTEP 3: Dentist gets the message and replies. You will provide the reply.")
+    dentist_fit_reply = input("DENTIST FIT REPLY > ")
+    handle_dentist_reply(
+        TEST_USER_ID,
+        dentist_fit_reply,
+        fit_confirm_chain,
+        get_user_session_from_db=mock_get_user_session_from_db,
+        update_user_session_in_db=mock_update_user_session_in_db,
+        update_case_in_db=mock_update_case_in_db
+    )
+    time.sleep(1)
+
+    # Check if the flow is waiting for the next choice
+    if mock_get_user_session_from_db(TEST_USER_ID).get("current_stage") == "awaiting_dispatch_choice":
+        # 4. Simulate the dentist replying about the dispatch method
+        print("\nSTEP 4: Dentist is asked for dispatch preference. You will provide the reply.")
+        dentist_dispatch_reply = input("DENTIST DISPATCH CHOICE > ")
+        handle_dispatch_choice_reply(
+            TEST_USER_ID,
+            dentist_dispatch_reply,
+            llm_instance,
+            get_user_session_from_db=mock_get_user_session_from_db,
+            update_user_session_in_db=mock_update_user_session_in_db,
+            get_case_from_db=mock_get_case_from_db,
+            update_case_in_db=mock_update_case_in_db
+        )
+
+    print("\n--- TEST COMPLETE ---")
+    print("Final database state:")
+    print(json.dumps(MOCK_DB, indent=2))
