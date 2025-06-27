@@ -1,59 +1,105 @@
 # production_workflow.py
-# FINAL, REFACTORED VERSION
-# A clean, single-file implementation of the production workflow,
-# refactored to be easily importable and testable.
+# DEPLOYMENT-READY VERSION
+# This file contains the complete, self-contained business logic for the
+# automated dental aligner production and communication workflow.
 
-import time
-import json
+# How to use this file:
+# 1. Implement the placeholder functions in SECTION 1 with your real services
+#    (e.g., Firebase, Twilio/Meta).
+# 2. In your server file (e.g., server.py), import the functions from this file.
+# 3. Initialize the LLM instance once in your server.
+# 4. Call `start_production_step()` from your backend to advance a case.
+# 5. Call `process_incoming_message()` from your webhook to handle replies from dentists.
+
 import os
 import requests
 from dotenv import load_dotenv
-from typing import Any, List, Optional, Mapping, Callable
+from typing import Any, List, Optional, Mapping
 
 from langchain_core.language_models.llms import LLM
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
 
+# Load environment variables from a .env file
+load_dotenv()
+
 
 # ==============================================================================
-# SECTION 1: CORE LOGIC & SERVICE PLACEHOLDERS
+# SECTION 1: SERVICE INTEGRATION PLACEHOLDERS
+#
+# TODO: You MUST implement these five functions with your actual services.
 # ==============================================================================
-
-# --- Service Placeholders (TODO: Implement these with your real services) ---
 
 def send_whatsapp_message(user_id: str, message: str):
-    """PLACEHOLDER: Sends a message via a real service like Twilio."""
+    """
+    IMPLEMENTATION REQUIRED: Sends a message to the user via your chosen provider.
+    - user_id: The recipient's identifier (e.g., 'whatsapp:+15551234567').
+    - message: The text content of the message to send.
+    """
     print("\n" + "=" * 60)
     print(f"✅ [SENDING WHATSAPP TO: {user_id}]")
     print(f"MESSAGE:\n{message}")
     print("=" * 60)
+    # Example for Meta/Twilio would involve an API call here.
+    # e.g., client.messages.create(from_='whatsapp:+<YOUR_NUM>', body=message, to=user_id)
+    raise NotImplementedError("Implement `send_whatsapp_message` with your API provider.")
 
 
-def get_case_from_db_real(case_id: str) -> dict:
-    """PLACEHOLDER: Gets case data from a real database like Firebase."""
-    raise NotImplementedError("This function should be implemented with a real database call.")
+def get_case_from_db(case_id: str) -> Optional[dict]:
+    """
+    IMPLEMENTATION REQUIRED: Gets case data from your database (e.g., Firebase).
+    - case_id: The unique identifier for the case.
+    - Returns a dictionary with case data or None if not found.
+    """
+    # Example for Firebase would be:
+    # doc_ref = db.collection('cases').document(case_id)
+    # doc = doc_ref.get()
+    # return doc.to_dict() if doc.exists else None
+    raise NotImplementedError("Implement `get_case_from_db` to fetch from your database.")
 
 
-def update_case_in_db_real(case_id: str, updates: dict):
-    """PLACEHOLDER: Updates a case in a real database like Firebase."""
-    raise NotImplementedError("This function should be implemented with a real database call.")
+def update_case_in_db(case_id: str, updates: dict):
+    """
+    IMPLEMENTATION REQUIRED: Updates a case document in your database.
+    - case_id: The unique identifier for the case to update.
+    - updates: A dictionary of fields to set or merge.
+    """
+    # Example for Firebase would be:
+    # db.collection('cases').document(case_id).update(updates)
+    raise NotImplementedError("Implement `update_case_in_db` for your database.")
 
 
-def get_user_session_from_db_real(user_id: str) -> dict:
-    """PLACEHOLDER: Gets a user's session from a real database like Firebase."""
-    raise NotImplementedError("This function should be implemented with a real database call.")
+def get_user_session_from_db(user_id: str) -> Optional[dict]:
+    """
+    IMPLEMENTATION REQUIRED: Gets a user's session data from your database.
+    - user_id: The user's unique identifier.
+    - Returns a dictionary with session data or None if not found.
+    """
+    # Example for Firebase would be:
+    # doc_ref = db.collection('user_sessions').document(user_id)
+    # doc = doc_ref.get()
+    # return doc.to_dict() if doc.exists else None
+    raise NotImplementedError("Implement `get_user_session_from_db` for your database.")
 
 
-def update_user_session_in_db_real(user_id: str, updates: dict):
-    """PLACEHOLDER: Updates a user's session in a real database like Firebase."""
-    raise NotImplementedError("This function should be implemented with a real database call.")
+def update_user_session_in_db(user_id: str, updates: dict):
+    """
+    IMPLEMENTATION REQUIRED: Updates a user's session in your database.
+    - user_id: The user's unique identifier.
+    - updates: A dictionary of fields to set or merge.
+    """
+    # Example for Firebase would be:
+    # db.collection('user_sessions').document(user_id).set(updates, merge=True)
+    raise NotImplementedError("Implement `update_user_session_in_db` for your database.")
 
 
-# --- LLM Setup ---
+# ==============================================================================
+# SECTION 2: LLM CONFIGURATION
+# ==============================================================================
 
 class CustomOpenRouterLLM(LLM):
-    """Your custom LLM class for OpenRouter."""
+    """Custom LLM class for OpenRouter API."""
     n: int
     model_to_use: str = "deepseek/deepseek-r1-0528:free"
 
@@ -66,7 +112,7 @@ class CustomOpenRouterLLM(LLM):
             run_manager: Optional[CallbackManagerForLLMRun] = None, **kwargs: Any
     ) -> str:
         api_key = os.getenv('OPENROUTER_API_KEY')
-        if not api_key: raise ValueError("OPENROUTER_API_KEY not found.")
+        if not api_key: raise ValueError("OPENROUTER_API_KEY not found in environment.")
         headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
         data = {'model': self.model_to_use, 'messages': [{'role': 'user', 'content': prompt}]}
         try:
@@ -81,15 +127,117 @@ class CustomOpenRouterLLM(LLM):
         return {"n": self.n, "model_name": self.model_to_use}
 
 
-# --- Core Workflow Functions (Refactored for Dependency Injection) ---
+# ==============================================================================
+# SECTION 3: INTERNAL WORKFLOW LOGIC
+# (These functions are called by the main entry points below)
+# ==============================================================================
 
-def start_production_step(
-        case_id: str,
-        get_case_from_db: Callable,
-        update_case_in_db: Callable,
-        update_user_session_in_db: Callable
-):
-    """Main engine function. It now accepts database functions as arguments."""
+def _trigger_fit_confirmation_request(case_id: str, user_id: str, patient_name: str):
+    """Internal: Sends the fit check message and updates system state."""
+    print(f"[SYSTEM] Delivery confirmed for case '{case_id}'. Requesting fit confirmation.")
+    message = f"Dear Doctor,\nOur records show the training aligner for patient '{patient_name}' has been delivered. Please confirm the fit once checked."
+    send_whatsapp_message(user_id, message)
+    update_case_in_db(case_id, {"status": "AwaitingFitConfirmation"})
+    update_user_session_in_db(user_id, {"current_stage": "awaiting_fit_confirmation"})
+
+
+def _handle_delivery_status_inquiry(user_id: str, session: dict):
+    """Internal: Handles messages while user is awaiting delivery."""
+    case_id = session.get("active_case")
+    case_data = get_case_from_db(case_id)
+    if not case_data: return
+
+    patient_name = case_data.get("patient_name")
+    delivery_status = case_data.get("delivery_status", "Info not available")
+
+    print(f"[CHATBOT] Dentist inquired about delivery. DB status: '{delivery_status}'")
+
+    if delivery_status and delivery_status.lower() == "delivered":
+        _trigger_fit_confirmation_request(case_id, user_id, patient_name)
+    else:
+        message = f"Hi Doctor, the current status for the aligner for patient '{patient_name}' is: {delivery_status}."
+        send_whatsapp_message(user_id, message)
+
+
+def _handle_fit_confirmation_reply(user_id: str, message_body: str, llm_instance: LLM, session: dict):
+    """Internal: Handles the 'yes/no' reply for aligner fit."""
+    case_id = session.get("active_case")
+    print(f"[CHATBOT] Dentist replied about fit: '{message_body}'. Calling LLM...")
+
+    prompt = PromptTemplate(input_variables=["user_response"],
+                            template="A dentist was asked if a training aligner fits correctly. Classify their response as 'Yes', 'No', or 'Unknown'. Respond with only one word.\n\nResponse: '{user_response}'\nClassification:")
+    chain = LLMChain(llm=llm_instance, prompt=prompt)
+
+    try:
+        fit_confirmation = chain.run(user_response=message_body).strip().lower()
+        print(f"[CHATBOT] LLM classified fit as: '{fit_confirmation}'")
+
+        if "yes" in fit_confirmation:
+            send_whatsapp_message(user_id,
+                                  "Excellent. Would you like the aligners dispatched Phase-Wise or as a Full Case?")
+            update_user_session_in_db(user_id, {"current_stage": "awaiting_dispatch_choice"})
+        elif "no" in fit_confirmation:
+            send_whatsapp_message(user_id,
+                                  "Thank you for the feedback. A member of our clinical team will contact you shortly.")
+            update_case_in_db(case_id, {"status": "FitIssueReported"})
+            update_user_session_in_db(user_id, {"current_stage": "general"})
+        else:
+            send_whatsapp_message(user_id,
+                                  "I'm sorry, I didn't quite understand. Does the aligner fit correctly? A simple 'yes' or 'no' would be helpful.")
+    except Exception as e:
+        print(f"❌ [LLM-ERROR] Could not process fit confirmation: {e}")
+
+
+def _handle_dispatch_choice_reply(user_id: str, message_body: str, llm_instance: LLM, session: dict):
+    """Internal: Handles the 'Phase-Wise' or 'Full Case' reply."""
+    case_id = session.get("active_case")
+    print(f"[CHATBOT] Dentist replied about dispatch choice: '{message_body}'. Calling LLM...")
+
+    prompt = PromptTemplate(input_variables=["user_response"],
+                            template="A dentist was asked if they want aligners dispatched 'Phase-Wise' or as a 'Full Case'. Classify their response. Respond with only 'PhaseWise', 'FullCase', or 'Unknown'.\n\nResponse: '{user_response}'\nChoice:")
+    chain = LLMChain(llm=llm_instance, prompt=prompt)
+
+    try:
+        dispatch_choice = chain.run(user_response=message_body).strip().lower()
+        print(f"[CHATBOT] LLM classified dispatch choice as: '{dispatch_choice}'")
+
+        new_status = None
+        if "phasewise" in dispatch_choice:
+            new_status = "FitConfirmed_PhaseWise"
+        elif "fullcase" in dispatch_choice:
+            new_status = "FitConfirmed_FullCase"
+
+        if new_status:
+            update_case_in_db(case_id, {"status": new_status})
+            update_user_session_in_db(user_id, {"current_stage": "general"})
+            start_production_step(case_id)  # Automatically trigger the next step
+        else:
+            send_whatsapp_message(user_id,
+                                  "My apologies, I'm not sure which option you'd prefer. Please reply with 'Phase-Wise' or 'Full Case'.")
+    except Exception as e:
+        print(f"❌ [LLM-ERROR] Could not process dispatch choice: {e}")
+
+
+# ==============================================================================
+# SECTION 4: MAIN ENTRY POINTS FOR YOUR SERVER
+#
+# These are the only two functions you should need to import and call from
+# your server code (e.g., server.py or main.py).
+# ==============================================================================
+
+def start_production_step(case_id: str):
+    """
+    SERVER ENTRY POINT 1: Call this from your backend to advance a case.
+
+    This function checks the case's current status and executes the next
+    automated step in the production workflow.
+
+    Example usage in your backend:
+    from production_workflow import start_production_step
+
+    # When a case is approved by your team:
+    start_production_step("case-abc-123")
+    """
     case_data = get_case_from_db(case_id)
     if not case_data:
         print(f"[ENGINE-ERROR] Case '{case_id}' not found.")
@@ -106,11 +254,13 @@ def start_production_step(
         print("➡️  [ENGINE] New status: CasePlanningComplete")
 
     elif status == "CasePlanningComplete":
-        send_whatsapp_message(user_id,
-                              f"Dear Doctor,\nThe training aligner for patient '{patient_name}' has been dispatched. Please confirm the fit once received.")
-        update_case_in_db(case_id, {"status": "AwaitingFitConfirmation"})
-        update_user_session_in_db(user_id, {"current_stage": "awaiting_fit_confirmation", "active_case": case_id})
-        print("➡️  [ENGINE] New status: AwaitingFitConfirmation. Waiting for dentist reply.")
+        msg = (f"Dear Doctor,\nThe training aligner for patient '{patient_name}' has been dispatched. "
+               "We will notify you upon delivery. You can also reply here for a status update.")
+        send_whatsapp_message(user_id, msg)
+        # Your system should update 'delivery_status' from the Google Sheet/delivery partner
+        update_case_in_db(case_id, {"status": "AwaitingDelivery", "delivery_status": "In Transit"})
+        update_user_session_in_db(user_id, {"current_stage": "awaiting_delivery", "active_case": case_id})
+        print("➡️  [ENGINE] New status: AwaitingDelivery.")
 
     elif status == "FitConfirmed_PhaseWise":
         send_whatsapp_message(user_id,
@@ -123,192 +273,45 @@ def start_production_step(
                               f"Thank you. The full set of aligners for '{patient_name}' is being prepared for dispatch.")
         update_case_in_db(case_id, {"status": "Dispatching_FullCase"})
         print("➡️  [ENGINE] New status: Dispatching_FullCase")
+
     else:
-        print(f"[ENGINE] Info: No automated action for status '{status}'.")
+        print(f"[ENGINE] Info: No automated action defined for status '{status}'.")
 
 
-def handle_dentist_reply(
-        user_id: str,
-        message_body: str,
-        llm_chain: LLMChain,
-        get_user_session_from_db: Callable,
-        update_user_session_in_db: Callable,
-        update_case_in_db: Callable
-):
-    """Handles the dentist's first reply. Accepts DB functions as arguments."""
-    session = get_user_session_from_db(user_id)
-    if session.get("current_stage") != "awaiting_fit_confirmation":
-        print("[CHATBOT] Message ignored (not awaiting confirmation).")
-        return
-
-    case_id = session.get("active_case")
-    print(f"\n[CHATBOT] Dentist replied: '{message_body}'. Calling LLM...")
-
-    try:
-        fit_confirmation = llm_chain.run(user_response=message_body).strip()
-        print(f"[CHATBOT] LLM classified fit confirmation as: '{fit_confirmation}'")
-
-        if "yes" in fit_confirmation.lower():
-            send_whatsapp_message(user_id,
-                                  "Excellent. Would you like the aligners dispatched Phase-Wise or as a Full Case?")
-            update_user_session_in_db(user_id, {"current_stage": "awaiting_dispatch_choice"})
-
-        elif "no" in fit_confirmation.lower():
-            send_whatsapp_message(user_id,
-                                  "Thank you for the feedback. A member of our clinical team will contact you shortly.")
-            update_case_in_db(case_id, {"status": "FitIssueReported"})
-            update_user_session_in_db(user_id, {"current_stage": "general"})
-
-        else:
-            send_whatsapp_message(user_id,
-                                  "I'm sorry, I didn't quite understand. Does the aligner fit correctly? A simple 'yes' or 'no' would be helpful.")
-
-    except Exception as e:
-        print(f"❌ [LLM-ERROR] API call failed: {e}")
-
-
-def handle_dispatch_choice_reply(
-        user_id: str,
-        message_body: str,
-        llm: LLM,
-        get_user_session_from_db: Callable,
-        update_user_session_in_db: Callable,
-        get_case_from_db: Callable,
-        update_case_in_db: Callable
-):
-    """Handles dispatch choice reply. Accepts DB functions and an LLM instance."""
-    session = get_user_session_from_db(user_id)
-    if session.get("current_stage") != "awaiting_dispatch_choice":
-        return
-
-    case_id = session.get("active_case")
-    print(f"\n[CHATBOT] Dentist replied about dispatch choice: '{message_body}'. Calling LLM...")
-
-    choice_prompt = PromptTemplate(
-        input_variables=["user_response"],
-        template="A dentist was asked if they want aligners dispatched 'Phase-Wise' or as a 'Full Case'. Classify their response. Respond with only 'PhaseWise', 'FullCase', or 'Unknown'.\n\nResponse: '{user_response}'\nChoice:"
-    )
-    choice_chain = LLMChain(llm=llm, prompt=choice_prompt)
-
-    try:
-        dispatch_choice = choice_chain.run(user_response=message_body).strip()
-        print(f"[CHATBOT] LLM classified dispatch choice as: '{dispatch_choice}'")
-
-        if "phasewise" in dispatch_choice.lower():
-            update_case_in_db(case_id, {"status": "FitConfirmed_PhaseWise"})
-        elif "fullcase" in dispatch_choice.lower():
-            update_case_in_db(case_id, {"status": "FitConfirmed_FullCase"})
-        else:
-            send_whatsapp_message(user_id,
-                                  "My apologies, I'm not sure which dispatch option you'd prefer. Please reply with 'Phase-Wise' or 'Full Case'.")
-            return
-
-        update_user_session_in_db(user_id, {"current_stage": "general"})
-        # Automatically trigger the next step after the choice is made
-        start_production_step(case_id, get_case_from_db, update_case_in_db, update_user_session_in_db)
-
-    except Exception as e:
-        print(f"❌ [LLM-ERROR] API call failed: {e}")
-
-
-# ==============================================================================
-# SECTION 2: IMPORTABLE TEST FUNCTION
-# ==============================================================================
-
-def run_interactive_test():
+def process_incoming_message(user_id: str, message_body: str, llm_instance: LLM):
     """
-    This function encapsulates the entire interactive test flow.
-    It creates its own mock database and mock functions, then passes them
-    to the core logic functions to run a self-contained test.
+    SERVER ENTRY POINT 2: Call this from your webhook for all incoming messages.
+
+    This function routes the message to the correct logic based on the user's
+    current stage in the conversation.
+
+    Example usage in your Flask/FastAPI webhook:
+    from production_workflow import process_incoming_message, CustomOpenRouterLLM
+
+    # Initialize LLM once when your server starts
+    llm = CustomOpenRouterLLM(n=1)
+
+    @app.route("/webhook", methods=["POST"])
+    def webhook():
+        data = request.json
+        user_id = data.get("from")
+        message_body = data.get("body")
+        process_incoming_message(user_id, message_body, llm)
+        return "OK", 200
     """
-    load_dotenv(override=True)
-    if not os.getenv("OPENROUTER_API_KEY"):
-        print("❌ FATAL: OPENROUTER_API_KEY not found in .env file. Cannot run test.")
+    session = get_user_session_from_db(user_id)
+    if not session or "current_stage" not in session:
+        print(f"[ROUTER] No active session found for user '{user_id}'. Ignoring message.")
         return
 
-    # --- Setup Mock Database for this specific test run ---
-    MOCK_DB = {
-        "cases": {},
-        "user_sessions": {}
-    }
+    stage = session["current_stage"]
+    print(f"\n[ROUTER] Routing message for user '{user_id}' in stage '{stage}'.")
 
-    # --- Define Mock DB functions for this test ---
-    def mock_get_case_from_db(case_id: str) -> dict:
-        return MOCK_DB["cases"].get(case_id, {})
-
-    def mock_update_case_in_db(case_id: str, updates: dict):
-        MOCK_DB["cases"].get(case_id, {}).update(updates)
-
-    def mock_get_user_session_from_db(user_id: str) -> dict:
-        return MOCK_DB["user_sessions"].get(user_id, {})
-
-    def mock_update_user_session_in_db(user_id: str, updates: dict):
-        MOCK_DB["user_sessions"].get(user_id, {}).update(updates)
-
-    # --- Initialize LLM Chain for the test ---
-    llm_instance = CustomOpenRouterLLM(n=1)
-    fit_prompt = PromptTemplate(input_variables=["user_response"],
-                                template="A dentist was asked if a training aligner fits correctly. Classify their response as 'Yes', 'No', or 'Unknown'. Respond with only one word.\n\nResponse: '{user_response}'\nClassification:")
-    fit_confirm_chain = LLMChain(llm=llm_instance, prompt=fit_prompt)
-
-    # --- Automated Test Sequence ---
-    TEST_CASE_ID = "case_simple_123"
-    TEST_USER_ID = "whatsapp_test_user"
-    MOCK_DB["cases"][TEST_CASE_ID] = {"patient_name": "Test Patient", "user_id": TEST_USER_ID,
-                                      "status": "ApprovedForProduction"}
-    MOCK_DB["user_sessions"][TEST_USER_ID] = {"current_stage": "general"}
-
-    print("\n--- STARTING INTERACTIVE WORKFLOW TEST ---")
-    time.sleep(1)
-
-    # 1. Start the process, passing the mock DB functions
-    print("\nSTEP 1: Your backend starts the production for the case.")
-    start_production_step(
-        TEST_CASE_ID,
-        get_case_from_db=mock_get_case_from_db,
-        update_case_in_db=mock_update_case_in_db,
-        update_user_session_in_db=mock_update_user_session_in_db
-    )
-    time.sleep(1)
-
-    # 2. Mark training aligner as dispatched
-    print("\nSTEP 2: Your backend marks the training aligner as dispatched.")
-    start_production_step(
-        TEST_CASE_ID,
-        get_case_from_db=mock_get_case_from_db,
-        update_case_in_db=mock_update_case_in_db,
-        update_user_session_in_db=mock_update_user_session_in_db
-    )
-    time.sleep(1)
-
-    # 3. Simulate dentist replying about the fit
-    print("\nSTEP 3: Dentist gets the message and replies. You will provide the reply.")
-    dentist_fit_reply = input("DENTIST FIT REPLY > ")
-    handle_dentist_reply(
-        TEST_USER_ID,
-        dentist_fit_reply,
-        fit_confirm_chain,
-        get_user_session_from_db=mock_get_user_session_from_db,
-        update_user_session_in_db=mock_update_user_session_in_db,
-        update_case_in_db=mock_update_case_in_db
-    )
-    time.sleep(1)
-
-    # Check if the flow is waiting for the next choice
-    if mock_get_user_session_from_db(TEST_USER_ID).get("current_stage") == "awaiting_dispatch_choice":
-        # 4. Simulate the dentist replying about the dispatch method
-        print("\nSTEP 4: Dentist is asked for dispatch preference. You will provide the reply.")
-        dentist_dispatch_reply = input("DENTIST DISPATCH CHOICE > ")
-        handle_dispatch_choice_reply(
-            TEST_USER_ID,
-            dentist_dispatch_reply,
-            llm_instance,
-            get_user_session_from_db=mock_get_user_session_from_db,
-            update_user_session_in_db=mock_update_user_session_in_db,
-            get_case_from_db=mock_get_case_from_db,
-            update_case_in_db=mock_update_case_in_db
-        )
-
-    print("\n--- TEST COMPLETE ---")
-    print("Final database state:")
-    print(json.dumps(MOCK_DB, indent=2))
+    if stage == "awaiting_delivery":
+        _handle_delivery_status_inquiry(user_id, session)
+    elif stage == "awaiting_fit_confirmation":
+        _handle_fit_confirmation_reply(user_id, message_body, llm_instance, session)
+    elif stage == "awaiting_dispatch_choice":
+        _handle_dispatch_choice_reply(user_id, message_body, llm_instance, session)
+    else:
+        print(f"[ROUTER] User is in stage '{stage}'. No specific action defined. Ignoring message.")
