@@ -907,10 +907,10 @@ In case if the case has to be delivered on urgent basis please intimate to us pr
         # In server.py, inside the handle_bot_logic function
 
         # ... (existing elif blocks for other stages) ...
-    elif session['current_stage'] == 'awaiting_fit_confirmation':
+    elif session['current_stage'] == 'case_begin':
         print("Processing in 'awaiting_fit_confirmation' stage...")
 
-        case_id = session.get('active_case_for_confirmation')
+        case_id = session['active']
         if not case_id:
             bot_response = "I'm sorry, I seem to have lost track of which case we were discussing. A team member will get in touch."
             session['current_stage'] = 'intent'
