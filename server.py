@@ -914,34 +914,30 @@ In case if the case has to be delivered on urgent basis please intimate to us pr
         if not case_id:
             bot_response = "I'm sorry, I seem to have lost track of which case we were discussing. A team member will get in touch."
             session['current_stage'] = 'intent'
-            # You might want to alert your team here as well
         else:
-            # Retrieve case details from Firebase
-            case_data = root_ref.child('cases').child(case_id).get()
-            patient_name = case_data.get('name', 'the patient') if case_data else 'the patient'
-
-            # Use the confirm_chain to interpret the Yes/No response
+            patient_name = root_ref.child('cases').child(case_id).child('name').get() or 'the patient'
             last_question = f"Should we go ahead with the fabrication for patient {patient_name}?"
             confirmation = confirm_chain.invoke({"input": message_body, "question": last_question})
-            print(f"Fit confirmation from dentist: '{confirmation}'")
 
             if 'yes' in confirmation.lower():
-                bot_response = "Thank you for the confirmation! We will now proceed with the fabrication of the remaining aligner sets."
-                # Trigger the next step in the production workflow
-                production_logic.start_full_case_fabrication(user_id, case_id, patient_name)
-                session['current_stage'] = 'intent'  # Reset state
+                bot_response = "Thank you for the confirmation! We will proceed with the fabrication."
+                # Update the case status so the engine knows the next step
+                root_ref.child('cases').child(case_id).update({'status': 'FitConfirmed'})
+                # Call the engine to automatically trigger the next step (fabrication message)
+                advance_production_workflow(case_id)
+                session['current_stage'] = 'intent'
+                session['active_case_for_confirmation'] = None
 
             elif 'no' in confirmation.lower():
                 bot_response = "Thank you for your feedback. A member of our clinical team will contact you shortly to troubleshoot the issue."
-                # Alert the internal team about the problem
-                production_logic.alert_team_on_fit_issue(user_id, case_id, patient_name, message_body)
-                session['current_stage'] = 'intent'  # Reset state
+                # Update status to a manual intervention state
+                root_ref.child('cases').child(case_id).update({'status': 'FitIssueReported'})
+                # Alert your internal team here if needed
+                session['current_stage'] = 'intent'
+                session['active_case_for_confirmation'] = None
 
             else:
                 bot_response = "I'm sorry, I didn't quite understand. Does the training aligner fit correctly? Please respond with 'Yes' or 'No'."
-                # The stage remains 'awaiting_fit_confirmation' to prompt the user again
-
-
     # ... (The rest of the stages and the Flask routes remain the same) ...
     # --- Tracking Case Stage ---
     elif session['current_stage'] == 'tracking_case':
