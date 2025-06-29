@@ -1,317 +1,262 @@
-# production_workflow.py
-# DEPLOYMENT-READY VERSION
-# This file contains the complete, self-contained business logic for the
-# automated dental aligner production and communication workflow.
-
-# How to use this file:
-# 1. Implement the placeholder functions in SECTION 1 with your real services
-#    (e.g., Firebase, Twilio/Meta).
-# 2. In your server file (e.g., server.py), import the functions from this file.
-# 3. Initialize the LLM instance once in your server.
-# 4. Call `start_production_step()` from your backend to advance a case.
-# 5. Call `process_incoming_message()` from your webhook to handle replies from dentists.
-
 import os
 import requests
 from dotenv import load_dotenv
-from typing import Any, List, Optional, Mapping
+from typing import Any, List, Optional, Mapping, Dict
 
 from langchain_core.language_models.llms import LLM
-from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
+from langchain_openai import ChatOpenAI # Required for OpenAI LLM
 
 # Load environment variables from a .env file
+# This is kept as LLM might still require API keys from environment
 load_dotenv()
 
-
 # ==============================================================================
-# SECTION 1: SERVICE INTEGRATION PLACEHOLDERS
-#
-# TODO: You MUST implement these five functions with your actual services.
+# SECTION 1: CONSOLIDATED WORKFLOW FUNCTION
+# (All logic, no direct I/O)
 # ==============================================================================
 
-def send_whatsapp_message(user_id: str, message: str):
+def dental_aligner_workflow(
+    action_type: str, # "start_production" or "process_message"
+    llm_instance: ChatOpenAI,
+    case_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    message_body: Optional[str] = None,
+    current_case_data: Optional[Dict[str, Any]] = None,
+    current_user_session: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
-    IMPLEMENTATION REQUIRED: Sends a message to the user via your chosen provider.
-    - user_id: The recipient's identifier (e.g., 'whatsapp:+15551234567').
-    - message: The text content of the message to send.
+    Executes the dental aligner production and communication workflow logic.
+    This function is a pure function: it takes all necessary current state as input
+    and returns all updated state and outgoing messages, without performing any
+    direct I/O (database operations or message sending).
+
+    Args:
+        action_type (str): Specifies the type of action to perform.
+                           - Use **"start_production"** when a new production step is triggered
+                             by your backend (e.g., after approval, delivery confirmation).
+                           - Use **"process_message"** when a dentist sends an incoming message.
+        llm_instance (ChatOpenAI): An initialized LangChain `ChatOpenAI` instance.
+                                    This must be provided by the caller.
+        case_id (Optional[str]): The unique identifier for the case relevant to the action.
+                                 Required for "start_production". For "process_message",
+                                 it's typically derived from `current_user_session['active_case']`.
+        user_id (Optional[str]): The unique identifier for the dentist/user (e.g., WhatsApp ID).
+                                 Required for "process_message" action.
+        message_body (Optional[str]): The text content of the incoming message from the dentist.
+                                      Required if `action_type` is "process_message".
+        current_case_data (Optional[Dict[str, Any]]): The current state of the case data.
+                                                       This **must be provided by the caller**
+                                                       and reflects your database's current view.
+                                                       Example: `{"id": "case-123", "status": "ApprovedForProduction", "user_id": "whatsapp:+123...", "patient_name": "Alice"}`
+        current_user_session (Optional[Dict[str, Any]]): The current state of the user's session data.
+                                                          This **must be provided by the caller**
+                                                          and reflects your database's current view.
+                                                          Example: `{"user_id": "whatsapp:+123...", "current_stage": "general", "active_case": "case-123"}`
+
+    Returns:
+        Dict[str, Any]: A dictionary containing the results of the operation:
+            - **'updated_case_data'**: The case data after potential modifications.
+                                     Your application should use this to update your database.
+            - **'updated_user_session'**: The user session data after potential modifications.
+                                        Your application should use this to update your database.
+            - **'messages_to_send'**: A `list` of dictionaries. Each dictionary contains:
+                                    `'recipient_id'` (str): The ID to send the message to.
+                                    `'content'` (str): The message text.
+                                    Your application should iterate this list and send messages.
+            - **'status'**: A string indicating the outcome ("Success", "Error", "NoAction").
+            - **'error'**: An error message string if `status` is "Error".
     """
-    print("\n" + "=" * 60)
-    print(f"✅ [SENDING WHATSAPP TO: {user_id}]")
-    print(f"MESSAGE:\n{message}")
-    print("=" * 60)
-    # Example for Meta/Twilio would involve an API call here.
-    # e.g., client.messages.create(from_='whatsapp:+<YOUR_NUM>', body=message, to=user_id)
-    raise NotImplementedError("Implement `send_whatsapp_message` with your API provider.")
 
+    # Initialize mutable data structures for updates and messages
+    updated_case_data = current_case_data.copy() if current_case_data else {}
+    updated_user_session = current_user_session.copy() if current_user_session else {}
+    messages_to_send = []
+    response_status = "Success"
+    error_message = None
 
-def get_case_from_db(case_id: str) -> Optional[dict]:
-    """
-    IMPLEMENTATION REQUIRED: Gets case data from your database (e.g., Firebase).
-    - case_id: The unique identifier for the case.
-    - Returns a dictionary with case data or None if not found.
-    """
-    # Example for Firebase would be:
-    # doc_ref = db.collection('cases').document(case_id)
-    # doc = doc_ref.get()
-    # return doc.to_dict() if doc.exists else None
-    raise NotImplementedError("Implement `get_case_from_db` to fetch from your database.")
-
-
-def update_case_in_db(case_id: str, updates: dict):
-    """
-    IMPLEMENTATION REQUIRED: Updates a case document in your database.
-    - case_id: The unique identifier for the case to update.
-    - updates: A dictionary of fields to set or merge.
-    """
-    # Example for Firebase would be:
-    # db.collection('cases').document(case_id).update(updates)
-    raise NotImplementedError("Implement `update_case_in_db` for your database.")
-
-
-def get_user_session_from_db(user_id: str) -> Optional[dict]:
-    """
-    IMPLEMENTATION REQUIRED: Gets a user's session data from your database.
-    - user_id: The user's unique identifier.
-    - Returns a dictionary with session data or None if not found.
-    """
-    # Example for Firebase would be:
-    # doc_ref = db.collection('user_sessions').document(user_id)
-    # doc = doc_ref.get()
-    # return doc.to_dict() if doc.exists else None
-    raise NotImplementedError("Implement `get_user_session_from_db` for your database.")
-
-
-def update_user_session_in_db(user_id: str, updates: dict):
-    """
-    IMPLEMENTATION REQUIRED: Updates a user's session in your database.
-    - user_id: The user's unique identifier.
-    - updates: A dictionary of fields to set or merge.
-    """
-    # Example for Firebase would be:
-    # db.collection('user_sessions').document(user_id).set(updates, merge=True)
-    raise NotImplementedError("Implement `update_user_session_in_db` for your database.")
-
-
-# ==============================================================================
-# SECTION 2: LLM CONFIGURATION
-# ==============================================================================
-
-class CustomOpenRouterLLM(LLM):
-    """Custom LLM class for OpenRouter API."""
-    n: int
-    model_to_use: str = "deepseek/deepseek-r1-0528:free"
-
-    @property
-    def _llm_type(self) -> str:
-        return "custom_openrouter_llm"
-
-    def _call(
-            self, prompt: str, stop: Optional[List[str]] = None,
-            run_manager: Optional[CallbackManagerForLLMRun] = None, **kwargs: Any
-    ) -> str:
-        api_key = os.getenv('OPENROUTER_API_KEY')
-        if not api_key: raise ValueError("OPENROUTER_API_KEY not found in environment.")
-        headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
-        data = {'model': self.model_to_use, 'messages': [{'role': 'user', 'content': prompt}]}
-        try:
-            response = requests.post('https://openrouter.ai/api/v1/chat/completions', headers=headers, json=data)
-            response.raise_for_status()
-            return response.json()['choices'][0]['message']['content']
-        except (requests.exceptions.RequestException, KeyError, IndexError) as e:
-            raise ValueError(f"API call or parsing failed: {e}")
-
-    @property
-    def _identifying_params(self) -> Mapping[str, Any]:
-        return {"n": self.n, "model_name": self.model_to_use}
-
-
-# ==============================================================================
-# SECTION 3: INTERNAL WORKFLOW LOGIC
-# (These functions are called by the main entry points below)
-# ==============================================================================
-
-def _trigger_fit_confirmation_request(case_id: str, user_id: str, patient_name: str):
-    """Internal: Sends the fit check message and updates system state."""
-    print(f"[SYSTEM] Delivery confirmed for case '{case_id}'. Requesting fit confirmation.")
-    message = f"Dear Doctor,\nOur records show the training aligner for patient '{patient_name}' has been delivered. Please confirm the fit once checked."
-    send_whatsapp_message(user_id, message)
-    update_case_in_db(case_id, {"status": "AwaitingFitConfirmation"})
-    update_user_session_in_db(user_id, {"current_stage": "awaiting_fit_confirmation"})
-
-
-def _handle_delivery_status_inquiry(user_id: str, session: dict):
-    """Internal: Handles messages while user is awaiting delivery."""
-    case_id = session.get("active_case")
-    case_data = get_case_from_db(case_id)
-    if not case_data: return
-
-    patient_name = case_data.get("patient_name")
-    delivery_status = case_data.get("delivery_status", "Info not available")
-
-    print(f"[CHATBOT] Dentist inquired about delivery. DB status: '{delivery_status}'")
-
-    if delivery_status and delivery_status.lower() == "delivered":
-        _trigger_fit_confirmation_request(case_id, user_id, patient_name)
-    else:
-        message = f"Hi Doctor, the current status for the aligner for patient '{patient_name}' is: {delivery_status}."
-        send_whatsapp_message(user_id, message)
-
-
-def _handle_fit_confirmation_reply(user_id: str, message_body: str, llm_instance: LLM, session: dict):
-    """Internal: Handles the 'yes/no' reply for aligner fit."""
-    case_id = session.get("active_case")
-    print(f"[CHATBOT] Dentist replied about fit: '{message_body}'. Calling LLM...")
-
-    prompt = PromptTemplate(input_variables=["user_response"],
-                            template="A dentist was asked if a training aligner fits correctly. Classify their response as 'Yes', 'No', or 'Unknown'. Respond with only one word.\n\nResponse: '{user_response}'\nClassification:")
-    chain = LLMChain(llm=llm_instance, prompt=prompt)
-
-    try:
-        fit_confirmation = chain.run(user_response=message_body).strip().lower()
-        print(f"[CHATBOT] LLM classified fit as: '{fit_confirmation}'")
-
-        if "yes" in fit_confirmation:
-            send_whatsapp_message(user_id,
-                                  "Excellent. Would you like the aligners dispatched Phase-Wise or as a Full Case?")
-            update_user_session_in_db(user_id, {"current_stage": "awaiting_dispatch_choice"})
-        elif "no" in fit_confirmation:
-            send_whatsapp_message(user_id,
-                                  "Thank you for the feedback. A member of our clinical team will contact you shortly.")
-            update_case_in_db(case_id, {"status": "FitIssueReported"})
-            update_user_session_in_db(user_id, {"current_stage": "general"})
+    if action_type == "start_production":
+        # --- Logic for starting a production step ---
+        if not case_id or not current_case_data:
+            error_message = "[ENGINE-ERROR] 'case_id' and 'current_case_data' must be provided for 'start_production' action."
+            response_status = "Error"
         else:
-            send_whatsapp_message(user_id,
-                                  "I'm sorry, I didn't quite understand. Does the aligner fit correctly? A simple 'yes' or 'no' would be helpful.")
-    except Exception as e:
-        print(f"❌ [LLM-ERROR] Could not process fit confirmation: {e}")
+            status = updated_case_data.get("status")
+            user_id_from_case = updated_case_data.get("user_id")
+            patient_name = updated_case_data.get("patient_name")
+            print(f"\n[ENGINE] Advancing case '{case_id}'. Current status: '{status}'") # Internal log
 
+            if status == "ApprovedForProduction":
+                messages_to_send.append({
+                    "recipient_id": user_id_from_case,
+                    "content": f"Dear Doctor, planning for patient '{patient_name}' has started."
+                })
+                updated_case_data["status"] = "CasePlanningComplete"
+                print("➡️  [ENGINE] New status: CasePlanningComplete") # Internal log
 
-def _handle_dispatch_choice_reply(user_id: str, message_body: str, llm_instance: LLM, session: dict):
-    """Internal: Handles the 'Phase-Wise' or 'Full Case' reply."""
-    case_id = session.get("active_case")
-    print(f"[CHATBOT] Dentist replied about dispatch choice: '{message_body}'. Calling LLM...")
+            elif status == "CasePlanningComplete":
+                msg = (f"Dear Doctor,\nThe training aligner for patient '{patient_name}' has been dispatched. "
+                       "We will notify you upon delivery. You can also reply here for a status update.")
+                messages_to_send.append({
+                    "recipient_id": user_id_from_case,
+                    "content": msg
+                })
+                updated_case_data["status"] = "AwaitingDelivery"
+                # Note: 'delivery_status' is typically updated by an external system (e.g., webhook from delivery partner)
+                updated_case_data["delivery_status"] = "In Transit"
+                updated_user_session["current_stage"] = "awaiting_delivery"
+                updated_user_session["active_case"] = case_id
+                print("➡️  [ENGINE] New status: AwaitingDelivery.") # Internal log
 
-    prompt = PromptTemplate(input_variables=["user_response"],
-                            template="A dentist was asked if they want aligners dispatched 'Phase-Wise' or as a 'Full Case'. Classify their response. Respond with only 'PhaseWise', 'FullCase', or 'Unknown'.\n\nResponse: '{user_response}'\nChoice:")
-    chain = LLMChain(llm=llm_instance, prompt=prompt)
+            elif status == "FitConfirmed_PhaseWise":
+                messages_to_send.append({
+                    "recipient_id": user_id_from_case,
+                    "content": f"Thank you. The first phase of aligners for '{patient_name}' is being prepared for dispatch."
+                })
+                updated_case_data["status"] = "Dispatching_PhaseWise"
+                print("➡️  [ENGINE] New status: Dispatching_PhaseWise") # Internal log
 
-    try:
-        dispatch_choice = chain.run(user_response=message_body).strip().lower()
-        print(f"[CHATBOT] LLM classified dispatch choice as: '{dispatch_choice}'")
+            elif status == "FitConfirmed_FullCase":
+                messages_to_send.append({
+                    "recipient_id": user_id_from_case,
+                    "content": f"Thank you. The full set of aligners for '{patient_name}' is being prepared for dispatch."
+                })
+                updated_case_data["status"] = "Dispatching_FullCase"
+                print("➡️  [ENGINE] New status: Dispatching_FullCase") # Internal log
 
-        new_status = None
-        if "phasewise" in dispatch_choice:
-            new_status = "FitConfirmed_PhaseWise"
-        elif "fullcase" in dispatch_choice:
-            new_status = "FitConfirmed_FullCase"
+            else:
+                print(f"[ENGINE] Info: No automated action defined for status '{status}'.") # Internal log
+                response_status = "NoAction"
 
-        if new_status:
-            update_case_in_db(case_id, {"status": new_status})
-            update_user_session_in_db(user_id, {"current_stage": "general"})
-            start_production_step(case_id)  # Automatically trigger the next step
+    elif action_type == "process_message":
+        # --- Logic for processing incoming messages ---
+        if not user_id or not message_body or not current_user_session:
+            error_message = "[ROUTER-ERROR] 'user_id', 'message_body', and 'current_user_session' must be provided for 'process_message' action."
+            response_status = "Error"
         else:
-            send_whatsapp_message(user_id,
-                                  "My apologies, I'm not sure which option you'd prefer. Please reply with 'Phase-Wise' or 'Full Case'.")
-    except Exception as e:
-        print(f"❌ [LLM-ERROR] Could not process dispatch choice: {e}")
+            stage = updated_user_session.get("current_stage")
+            active_case_id = updated_user_session.get("active_case")
+            print(f"\n[ROUTER] Routing message for user '{user_id}' in stage '{stage}'.") # Internal log
 
+            if stage == "awaiting_delivery":
+                # Inlined delivery status inquiry logic
+                if not active_case_id or not current_case_data:
+                    print("[CHATBOT] No active case for user in awaiting_delivery stage.") # Internal log
+                    error_message = "No active case or case data found for this user to inquire about delivery."
+                    response_status = "Error"
+                else:
+                    patient_name = updated_case_data.get("patient_name")
+                    delivery_status = updated_case_data.get("delivery_status", "Info not available")
 
-# ==============================================================================
-# SECTION 4: MAIN ENTRY POINTS FOR YOUR SERVER
-#
-# These are the only two functions you should need to import and call from
-# your server code (e.g., server.py or main.py).
-# ==============================================================================
+                    print(f"[CHATBOT] Dentist inquired about delivery. DB status: '{delivery_status}'") # Internal log
 
-def start_production_step(case_id: str):
-    """
-    SERVER ENTRY POINT 1: Call this from your backend to advance a case.
+                    if delivery_status and delivery_status.lower() == "delivered":
+                        # Inlined fit confirmation request logic
+                        print(f"[SYSTEM] Delivery confirmed for case '{active_case_id}'. Requesting fit confirmation.") # Internal log
+                        messages_to_send.append({
+                            "recipient_id": user_id,
+                            "content": f"Dear Doctor,\nOur records show the training aligner for patient '{patient_name}' has been delivered. Please confirm the fit once checked."
+                        })
+                        updated_case_data["status"] = "AwaitingFitConfirmation"
+                        updated_user_session["current_stage"] = "awaiting_fit_confirmation"
+                    else:
+                        messages_to_send.append({
+                            "recipient_id": user_id,
+                            "content": f"Hi Doctor, the current status for the aligner for patient '{patient_name}' is: {delivery_status}."
+                        })
 
-    This function checks the case's current status and executes the next
-    automated step in the production workflow.
+            elif stage == "awaiting_fit_confirmation":
+                # Inlined fit confirmation reply logic
+                if not active_case_id:
+                    print("[CHATBOT] No active case for user in awaiting_fit_confirmation stage.") # Internal log
+                    error_message = "No active case found for this user to confirm fit."
+                    response_status = "Error"
+                else:
+                    print(f"[CHATBOT] Dentist replied about fit: '{message_body}'. Calling LLM...") # Internal log
+                    prompt = PromptTemplate(input_variables=["user_response"],
+                                            template="A dentist was asked if a training aligner fits correctly. Classify their response as 'Yes', 'No', or 'Unknown'. Respond with only one word.\n\nResponse: '{user_response}'\nClassification:")
+                    chain = LLMChain(llm=llm_instance, prompt=prompt)
 
-    Example usage in your backend:
-    from production_workflow import start_production_step
+                    try:
+                        fit_confirmation = chain.run(user_response=message_body).strip().lower()
+                        print(f"[CHATBOT] LLM classified fit as: '{fit_confirmation}'") # Internal log
 
-    # When a case is approved by your team:
-    start_production_step("case-abc-123")
-    """
-    case_data = get_case_from_db(case_id)
-    if not case_data:
-        print(f"[ENGINE-ERROR] Case '{case_id}' not found.")
-        return
+                        if "yes" in fit_confirmation:
+                            messages_to_send.append({
+                                "recipient_id": user_id,
+                                "content": "Excellent. Would you like the aligners dispatched Phase-Wise or as a Full Case?"
+                            })
+                            updated_user_session["current_stage"] = "awaiting_dispatch_choice"
+                        elif "no" in fit_confirmation:
+                            messages_to_send.append({
+                                "recipient_id": user_id,
+                                "content": "Thank you for the feedback. A member of our clinical team will contact you shortly."
+                            })
+                            updated_case_data["status"] = "FitIssueReported"
+                            updated_user_session["current_stage"] = "general"
+                        else:
+                            messages_to_send.append({
+                                "recipient_id": user_id,
+                                "content": "I'm sorry, I didn't quite understand. Does the aligner fit correctly? A simple 'yes' or 'no' would be helpful."
+                            })
+                    except Exception as e:
+                        print(f"❌ [LLM-ERROR] Could not process fit confirmation: {e}") # Internal log
+                        error_message = f"LLM error during fit confirmation: {e}"
+                        response_status = "Error"
 
-    status = case_data.get("status")
-    user_id = case_data.get("user_id")
-    patient_name = case_data.get("patient_name")
-    print(f"\n[ENGINE] Advancing case '{case_id}'. Current status: '{status}'")
+            elif stage == "awaiting_dispatch_choice":
+                # Inlined dispatch choice reply logic
+                if not active_case_id:
+                    print("[CHATBOT] No active case for user in awaiting_dispatch_choice stage.") # Internal log
+                    error_message = "No active case found for this user to confirm dispatch choice."
+                    response_status = "Error"
+                else:
+                    print(f"[CHATBOT] Dentist replied about dispatch choice: '{message_body}'. Calling LLM...") # Internal log
+                    prompt = PromptTemplate(input_variables=["user_response"],
+                                            template="A dentist was asked if they want aligners dispatched 'Phase-Wise' or as a 'Full Case'. Classify their response. Respond with only 'PhaseWise', 'FullCase', or 'Unknown'.\n\nResponse: '{user_response}'\nChoice:")
+                    chain = LLMChain(llm=llm_instance, prompt=prompt)
 
-    if status == "ApprovedForProduction":
-        send_whatsapp_message(user_id, f"Dear Doctor, planning for patient '{patient_name}' has started.")
-        update_case_in_db(case_id, {"status": "CasePlanningComplete"})
-        print("➡️  [ENGINE] New status: CasePlanningComplete")
+                    try:
+                        dispatch_choice = chain.run(user_response=message_body).strip().lower()
+                        print(f"[CHATBOT] LLM classified dispatch choice as: '{dispatch_choice}'") # Internal log
 
-    elif status == "CasePlanningComplete":
-        msg = (f"Dear Doctor,\nThe training aligner for patient '{patient_name}' has been dispatched. "
-               "We will notify you upon delivery. You can also reply here for a status update.")
-        send_whatsapp_message(user_id, msg)
-        # Your system should update 'delivery_status' from the Google Sheet/delivery partner
-        update_case_in_db(case_id, {"status": "AwaitingDelivery", "delivery_status": "In Transit"})
-        update_user_session_in_db(user_id, {"current_stage": "awaiting_delivery", "active_case": case_id})
-        print("➡️  [ENGINE] New status: AwaitingDelivery.")
+                        new_status = None
+                        if "phasewise" in dispatch_choice:
+                            new_status = "FitConfirmed_PhaseWise"
+                        elif "fullcase" in dispatch_choice:
+                            new_status = "FitConfirmed_FullCase"
 
-    elif status == "FitConfirmed_PhaseWise":
-        send_whatsapp_message(user_id,
-                              f"Thank you. The first phase of aligners for '{patient_name}' is being prepared for dispatch.")
-        update_case_in_db(case_id, {"status": "Dispatching_PhaseWise"})
-        print("➡️  [ENGINE] New status: Dispatching_PhaseWise")
-
-    elif status == "FitConfirmed_FullCase":
-        send_whatsapp_message(user_id,
-                              f"Thank you. The full set of aligners for '{patient_name}' is being prepared for dispatch.")
-        update_case_in_db(case_id, {"status": "Dispatching_FullCase"})
-        print("➡️  [ENGINE] New status: Dispatching_FullCase")
+                        if new_status:
+                            updated_case_data["status"] = new_status
+                            updated_user_session["current_stage"] = "general"
+                            # IMPORTANT: The original workflow would have triggered `start_production_step` here.
+                            # In this pure function, you should have your *backend* observe the returned
+                            # `updated_case_data['status']` and, if it matches a trigger condition (e.g., "FitConfirmed_PhaseWise"),
+                            # then make a *subsequent* call to `dental_aligner_workflow` with `action_type="start_production"`
+                            # and the latest case data to advance that specific step.
+                        else:
+                            messages_to_send.append({
+                                "recipient_id": user_id,
+                                "content": "My apologies, I'm not sure which option you'd prefer. Please reply with 'Phase-Wise' or 'Full Case'."
+                            })
+                    except Exception as e:
+                        print(f"❌ [LLM-ERROR] Could not process dispatch choice: {e}") # Internal log
+                        error_message = f"LLM error during dispatch choice: {e}"
+                        response_status = "Error"
+            else:
+                print(f"[ROUTER] User is in stage '{stage}'. No specific action defined. Ignoring message.") # Internal log
+                error_message = f"User is in unhandled stage '{stage}'."
+                response_status = "NoAction" # Custom status for "no specific action taken"
 
     else:
-        print(f"[ENGINE] Info: No automated action defined for status '{status}'.")
+        error_message = "Invalid 'action_type' provided. Must be 'start_production' or 'process_message'."
+        response_status = "Error"
 
-
-def process_incoming_message(user_id: str, message_body: str, llm_instance: LLM):
-    """
-    SERVER ENTRY POINT 2: Call this from your webhook for all incoming messages.
-
-    This function routes the message to the correct logic based on the user's
-    current stage in the conversation.
-
-    Example usage in your Flask/FastAPI webhook:
-    from production_workflow import process_incoming_message, CustomOpenRouterLLM
-
-    # Initialize LLM once when your server starts
-    llm = CustomOpenRouterLLM(n=1)
-
-    @app.route("/webhook", methods=["POST"])
-    def webhook():
-        data = request.json
-        user_id = data.get("from")
-        message_body = data.get("body")
-        process_incoming_message(user_id, message_body, llm)
-        return "OK", 200
-    """
-    session = get_user_session_from_db(user_id)
-    if not session or "current_stage" not in session:
-        print(f"[ROUTER] No active session found for user '{user_id}'. Ignoring message.")
-        return
-
-    stage = session["current_stage"]
-    print(f"\n[ROUTER] Routing message for user '{user_id}' in stage '{stage}'.")
-
-    if stage == "awaiting_delivery":
-        _handle_delivery_status_inquiry(user_id, session)
-    elif stage == "awaiting_fit_confirmation":
-        _handle_fit_confirmation_reply(user_id, message_body, llm_instance, session)
-    elif stage == "awaiting_dispatch_choice":
-        _handle_dispatch_choice_reply(user_id, message_body, llm_instance, session)
-    else:
-        print(f"[ROUTER] User is in stage '{stage}'. No specific action defined. Ignoring message.")
+    return {
+        "updated_case_data": updated_case_data,
+        "updated_user_session": updated_user_session,
+        "messages_to_send": messages_to_send,
+        "status": response_status,
+        "error": error_message
+    }
