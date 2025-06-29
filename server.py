@@ -38,6 +38,16 @@ from langchain_core.messages import BaseMessage
 from typing import List
 import re
 import prod_workflow
+from flask import Flask, request
+import requests
+import json
+import time
+
+# 🔐 Meta Credentials (replace with your actual credentials)
+# ------------------------------------------------------------------
+VERIFY_TOKEN = "12345"
+
+PHONE_NUMBER_ID = "719531424575718"
 class NoThinkLLMWrapper(BaseChatModel):
     wrapped_llm: BaseChatModel
 
@@ -120,7 +130,9 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
 FORWARD_TO_WHATSAPP_NUMBER = os.getenv("FORWARD_TO_WHATSAPP_NUMBER")
+ACCESS_TOKEN = os.getenv("ACESS")
 print(TWILIO_WHATSAPP_NUMBER)
+print(FORWARD_TO_WHATSAPP_NUMBER)
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # --- Temporary storage for media files ---
@@ -138,8 +150,8 @@ llm = ChatOpenAI(
 )
 
 #llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.3)
-#llm = ChatOllama(model="deepseek-r1:7b")
-#llm = NoThinkLLMWrapper(wrapped_llm=llm)
+llm = ChatOllama(model="deepseek-r1:7b")
+llm = NoThinkLLMWrapper(wrapped_llm=llm)
 model = llm
 #======================================
 #intent prompts
@@ -334,12 +346,12 @@ def initialize_user_session(user_id):
             'expected_images': 0
         })
 
-def forward_media_to_number(media_url, sender_whatsapp_id,label ="images"):
+def forward_media_to_number(media_url, sender_whatsapp_id, label="images"):
     """
-    Downloads media from Twilio's authenticated URL, saves it locally,
-    and then forwards it via a temporary Flask-served public URL.
+    Downloads media from WhatsApp Cloud API URL, saves it locally,
+    uploads it to Google Drive, and sends a text message with the Drive link.
     """
-    temp_file_name = None # Store just the file name
+    temp_file_name = None
     try:
         if not FORWARD_TO_WHATSAPP_NUMBER:
             print("FORWARD_TO_WHATSAPP_NUMBER is not set in .env. Cannot forward media.")
@@ -347,19 +359,19 @@ def forward_media_to_number(media_url, sender_whatsapp_id,label ="images"):
 
         print(f"Attempting to download media from: {media_url}")
 
-        # Download the media with Twilio authentication
-        response = requests.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
-        response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+        # Download media with Cloud API auth
+        response = requests.get(media_url, headers={"Authorization": f"Bearer {ACCESS_TOKEN}"})
+        response.raise_for_status()
 
         # Get file extension from content-type header
         content_type = response.headers.get('Content-Type')
         extension = mimetypes.guess_extension(content_type) if content_type else '.bin'
-        if not extension and '.' in media_url: # Fallback to URL extension if mimetype fails
+        if not extension and '.' in media_url:
             extension = os.path.splitext(media_url)[1]
         if not extension:
-            extension = '.jpeg' # Default to jpeg if no extension can be determined (adjust as needed)
+            extension = '.jpeg'
 
-        # Generate a unique file name to avoid clashes
+        # Generate unique filename
         temp_file_name = f"{uuid.uuid4()}{extension}"
         temp_file_path = os.path.join(MEDIA_TEMP_DIR, temp_file_name)
 
@@ -368,50 +380,99 @@ def forward_media_to_number(media_url, sender_whatsapp_id,label ="images"):
 
         print(f"Media downloaded to temporary file: {temp_file_path}")
         print(sender_whatsapp_id)
-        client_fb =user_sessions_fb.child(sender_whatsapp_id)
+
+        client_fb = user_sessions_fb.child(sender_whatsapp_id)
         caseid = client_fb.child('active').get()
-        # Construct the public URL for the temporary file
-        drive_link = upload_drive(temp_file_path, temp_file_name, content_type,client_fb.child('name').get(),client_fb.child(caseid).child('name').get(),label)
+
+        # Upload to Google Drive
+        drive_link = upload_drive(
+            temp_file_path,
+            temp_file_name,
+            content_type,
+            client_fb.child('name').get(),
+            client_fb.child(caseid).child('name').get(),
+            label
+        )
+
         if not drive_link:
-            print("Failed to upload file to Google Drive. Cannot forward media.")
+            print("Failed to upload file to Google Drive. Cannot send link.")
             return False
 
-        # Now, forward the media using the Google Drive public URL
-        message = twilio_client.messages.create(
-            from_=TWILIO_WHATSAPP_NUMBER,
-            to="whatsapp:+917801833884",
-            media_url=[drive_link], # <--- Pass the Google Drive public URL
-            body=f"Image from {sender_whatsapp_id} for case: {caseid}"
-        )
-        print(f"Media forwarded via Google Drive. Message SID: {message.sid}")
+        print(f"Uploaded to Google Drive. Link: {drive_link}")
 
-        # Schedule temporary local file for deletion (it's no longer needed after Drive upload)
-        delete_file_after_delay(temp_file_path, delay=5) # 
+        # Send text message with drive link
+        send_url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
+        message_data = {
+            "messaging_product": "whatsapp",
+            "to": FORWARD_TO_WHATSAPP_NUMBER,
+            "type": "text",
+            "text": {
+                "body": f"Media from {sender_whatsapp_id} for case: {caseid}\n{drive_link}"
+            }
+        }
+
+        send_response = requests.post(
+            send_url,
+            headers={
+                "Authorization": f"Bearer {ACCESS_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            json=message_data
+        )
+        send_response.raise_for_status()
+        print(f"Text message with Drive link sent. Response: {send_response.json()}")
+
+        delete_file_after_delay(temp_file_path, delay=5)
         return True
 
     except requests.exceptions.HTTPError as e:
-        print(f"HTTP Error downloading media from Twilio: {e.response.status_code} - {e.response.text}")
-        if temp_file_name and os.path.exists(os.path.join(MEDIA_TEMP_DIR, temp_file_name)):
-            os.remove(os.path.join(MEDIA_TEMP_DIR, temp_file_name))
-        return False
+        print(f"HTTP Error: {e.response.status_code} - {e.response.text}")
     except Exception as e:
-        print(f"Error forwarding media (after download attempt): {e}")
-        if temp_file_name and os.path.exists(os.path.join(MEDIA_TEMP_DIR, temp_file_name)):
-            os.remove(os.path.join(MEDIA_TEMP_DIR, temp_file_name))
-        return False
+        print(f"Error in media forwarding: {e}")
+    finally:
+        if temp_file_name:
+            temp_file_path = os.path.join(MEDIA_TEMP_DIR, temp_file_name)
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+
+    return False
+
+
 
 def handle_bot_logic(user_id, message_body, num_media, media_urls, media_content_types,session):
+    manual_test =False
     temp = True
     caseid =""
-    if session['auth_memory'] :
-        print("here auth")
-        session['auth_memory'] = sl(session['auth_memory'])
-    else :
+     # --- Memory Deserialization at the START ---
+    # Ensure 'auth_memory' is a ConversationBufferMemory object
+    if 'auth_memory' in session and session['auth_memory'] is not False and session['auth_memory'] is not None:
+        if isinstance(session['auth_memory'], list):
+            try:
+                session['auth_memory'] = sl(session['auth_memory'])
+                print("Auth memory deserialized from session (list -> object).")
+            except Exception as e:
+                print(f"Error deserializing auth_memory: {e}. Reinitializing.")
+                session['auth_memory'] = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        # If it's already an object, do nothing (e.g., from prior logic in the same request)
+    else:
+        # Initialize if not present or was explicitly False/None
         session['auth_memory'] = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-    if session['sched_memory'] :
-        session['sched_memory'] = sl(session['sched_memory'])
-    else :
+        print("Auth memory initialized anew.")
+
+    # Ensure 'sched_memory' is a ConversationBufferMemory object
+    if 'sched_memory' in session and session['sched_memory'] is not False and session['sched_memory'] is not None:
+        if isinstance(session['sched_memory'], list):
+            try:
+                session['sched_memory'] = sl(session['sched_memory'])
+                print("Sched memory deserialized from session (list -> object).")
+            except Exception as e:
+                print(f"Error deserializing sched_memory: {e}. Reinitializing.")
+                session['sched_memory'] = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        # If it's already an object, do nothing
+    else:
+        # Initialize if not present or was explicitly False/None
         session['sched_memory'] = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        print("Sched memory initialized anew.")
     
     """
     Integrates the bot's logic from mainlogic.py to process a single message.
@@ -593,7 +654,7 @@ If registration is successful:
 Please choose how you'd like to proceed with the new aligner case:
 """         
         elif 'Unclear Intent' in session['app_state']:
-            temp =False
+            temp =True
             bot_response = 'HXF0d74b90bbc7fb77db59ac99869bfde'
         elif 'Aligner By-Products' in session['app_state']:
             pass
@@ -955,83 +1016,173 @@ In case if the case has to be delivered on urgent basis please intimate to us pr
     # --- Final check before returning ---
     print(f"Final bot_response to be sent: '{bot_response}'")
     print(f"--- End handle_bot_logic ---\n")
-    if ls(session['sched_memory']) :
+    # --- Memory Serialization at the END ---
+    # Convert ConversationBufferMemory objects back to serializable format (list of messages)
+    if isinstance(session.get('sched_memory'), ConversationBufferMemory):
         session['sched_memory'] = ls(session['sched_memory'])
+        print("Sched memory serialized (object -> list).")
     else:
-        session['sched_memory'] = False
-    if ls(session['auth_memory']) :
-        session['auth_memory'] = ls(session['auth_memory'])
-    else:
-        session['auth_memory']= False
-    session['calender_service'] = True
-    update_db(user_id,session)
+        # Ensure it's a serializable format if it's not a memory object
+        # e.g., if it was initialized as False or cleared
+        session['sched_memory'] = [] # Store as empty list instead of False for consistency
+        print("Sched memory set to empty list for saving.")
 
+    if isinstance(session.get('auth_memory'), ConversationBufferMemory):
+        session['auth_memory'] = ls(session['auth_memory'])
+        print("Auth memory serialized (object -> list).")
+    else:
+        session['auth_memory'] = [] # Store as empty list
+        print("Auth memory set to empty list for saving.")
+
+    session['calendar_service'] = session.get('calendar_service', True)
+    update_db(user_id,session)
+    print(f"exited_handlebot with : {bot_response}")
     return temp,bot_response
 
 
-# ==============================================================================
-# 4. FLASK ROUTES
-# ==============================================================================
-from flask import Flask, request
-from twilio.twiml.messaging_response import MessagingResponse
-import requests
-import os
-@app.route("/whatsapp"  , methods=["POST"])
+# Get downloadable media URL from media ID
+def get_media_url(media_id):
+    url = f"https://graph.facebook.com/v18.0/{media_id}"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    response = requests.get(url, headers=headers)
+    return response.json().get("url", "")
+
+# Send text message
+def send_whatsapp_text(to, body):
+    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": body}
+    }
+    res = requests.post(url, headers=headers, json=payload)
+    print("📤 Text sent:", res.status_code, res.text)
+
+# Send template message
+def send_whatsapp_template(to):
+    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": "your_template_name",  # Replace with your actual template name
+            "language": {"code": "en_US"},
+            "components": []  # Add variables if required
+        }
+    }
+    res = requests.post(url, headers=headers, json=payload)
+    print("📤 Template sent:", res.status_code, res.text)
+
+# ✅ MAIN WHATSAPP CLOUD API WEBHOOK
+@app.route("/webhook", methods=["GET"])
+def verify():
+    if request.args.get("hub.mode") == "subscribe" and request.args.get("hub.verify_token") == VERIFY_TOKEN:
+        return request.args.get("hub.challenge"), 200
+    return "Verification failed", 403
+
+@app.route("/webhook", methods=["POST"])
 def whatsapp_webhook():
-    """
-    Twilio webhook endpoint for incoming WhatsApp messages.
-    """
+    data = request.get_json()
+    try:
+        # Navigate the webhook payload structure safely
+        entry = data.get("entry", [])[0] if data.get("entry") else None
+        if not entry:
+            print("No 'entry' in webhook data. Skipping.")
+            return "No entry", 200
 
-    incoming_msg = request.values.get("Body", "")
-    sender_id = request.values.get("From", "")
-    num_media = int(request.values.get("NumMedia", 0))
-    latitude = request.form.get("Latitude")
-    longitude = request.form.get("Longitude")
-    parent_message_sid_from_prod_reply = request.values.get("OriginalRepliedMessageSid", None)
+        change = entry.get("changes", [])[0] if entry.get("changes") else None
+        if not change:
+            print("No 'changes' in webhook entry. Skipping.")
+            return "No changes", 200
 
-    media_urls = []
-    media_content_types = []
+        value = change.get("value", {})
 
-    if latitude and longitude:
-        location_url = f"https://www.google.com/maps?q={latitude},{longitude}"
-        print("User location received:", location_url)
-        incoming_msg = location_url
+        # --- CRITICAL FILTERING LOGIC ---
+        # Only process if it's an actual 'messages' array and not a 'statuses' array
+        if 'messages' in value and value['messages']:
+            # This is an actual incoming user message
+            message = value['messages'][0]
+            contacts = value.get("contacts", []) # Get contacts for sender_id
 
-    if num_media > 0:
-        for i in range(num_media):
-            media_url = request.values.get(f"MediaUrl{i}")
-            content_type = request.values.get(f"MediaContentType{i}")
-            media_urls.append(media_url)
-            media_content_types.append(content_type)
-            print(f"Received media: {media_url} (Content-Type: {content_type})")
+            if not contacts:
+                print("No 'contacts' in message event. Skipping.")
+                return "No contacts in message event", 200 # Should ideally not happen for valid messages
 
-    session = user_sessions_fb.child(sender_id).get()
-    if session is not None:
-        session = dict(session)
-        bot_response = handle_bot_logic(
-            sender_id, incoming_msg, num_media, media_urls, media_content_types, session
-        )
-    else:
-        initialize_user_session(sender_id)
+            contact = contacts[0]
+            sender_id = f"whatsapp:+{contact['wa_id']}" # Correct sender_id format
+            incoming_msg = ""
+            media_urls = []
+            media_content_types = []
+            num_media = 0
 
-    resp = MessagingResponse()
-    if bot_response[0]:
-        twilio_client.messages.create(
-            from_=TWILIO_WHATSAPP_NUMBER,
-            to=sender_id,
-            body=bot_response[1]
-        )
-    else:
-        twilio_client.messages.create(
-        from_=TWILIO_WHATSAPP_NUMBER,  # Twilio Sandbox or your approved number
-        to=sender_id,    # Customer's WhatsApp number
-        content_sid="HXf0d74b90bbc7fb77db59ac99869bfded",  # From the image
-        content_variables='{}'          # Populate this if your template uses variables
-        )
+            msg_type = message.get("type")
 
-    return str(resp)
- # This is the ONLY line that should send the TwiML to Twilio
+            if msg_type == "text":
+                incoming_msg = message["text"]["body"]
+            elif msg_type == "image":
+                media_id = message["image"]["id"]
+                media_url = get_media_url(media_id)
+                media_urls.append(media_url)
+                media_content_types.append(message["image"].get("mime_type", "image/jpeg"))
+                num_media = 1
+                incoming_msg = "[Image received]"
+            elif msg_type == "location":
+                latitude = message["location"]["latitude"]
+                longitude = message["location"]["longitude"]
+                incoming_msg = f"https://www.google.com/maps?q={latitude},{longitude}"
+            # Add other message types (audio, video, document, etc.) as needed
 
+            # --- SESSION HANDLING ---
+            session = user_sessions_fb.child(sender_id).get()
+
+            if session is None:
+                initialize_user_session(sender_id)
+                session = user_sessions_fb.child(sender_id).get() # Re-fetch newly created session
+                # If you want to send a welcome message for new users only once, do it here
+                # send_whatsapp_text(sender_id, "Welcome to 3D-Align! Please provide your full name to get started.")
+            print(data)
+            # --- CALL MAIN BOT LOGIC (Synchronously) ---
+            temp_status, bot_response_content = handle_bot_logic(
+                sender_id, incoming_msg, num_media, media_urls, media_content_types, session
+            )
+            print(f"handle_bot_logic returned: {temp_status}, '{bot_response_content}'")
+
+            # --- Send Bot's Reply ---
+            if temp_status:
+                send_whatsapp_text(sender_id, bot_response_content)
+            else:
+                send_whatsapp_template(sender_id)
+
+        elif 'statuses' in value and value['statuses']:
+            # This is a message status update (e.g., delivered, read)
+            status_update = value['statuses'][0]
+            print(f"Received message status update: ID={status_update.get('id')}, Status={status_update.get('status')}")
+            # Do NOT call handle_bot_logic for status updates.
+            # You can add specific logging or database updates for message statuses here if needed.
+        else:
+            print(f"Webhook event received with no 'messages' or 'statuses' in value, or empty arrays. Skipping. Value: {value}")
+
+    except IndexError:
+        # Handles cases where 'entry' or 'changes' might be empty lists
+        print("Webhook data structure missing expected 'entry' or 'changes' element. Skipping.")
+    except Exception as e:
+        print(f"❌ Error processing webhook data: {e}")
+        import traceback
+        traceback.print_exc() # Print full traceback for debugging
+
+    # Always return 200 OK to WhatsApp regardless of internal processing outcome
+    # This is crucial to prevent retries.
+    return "EVENT_RECEIVED", 200
 
 # ==============================================================================
 # 5. RUN THE FLASK APP
@@ -1056,7 +1207,7 @@ if __name__ == "__main__":
         print("   to the HTTPS URL ngrok provides (e.g., https://xxxxxxxxxxxx.ngrok-free.app).\n")
     manual_test = False
     while manual_test:
-        sender_id = "whatsapp:+917801833662"
+        sender_id = "whatsapp:+917801831000"
         num_media = 0
         media_urls =[]
         session = user_sessions_fb.child(sender_id).get()
@@ -1068,4 +1219,4 @@ if __name__ == "__main__":
             bot_response = handle_bot_logic(sender_id, incoming_msg, num_media, media_urls, media_content_types, session )
         else :
             initialize_user_session(sender_id)
-    app.run(debug=True, port=5000)
+    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)

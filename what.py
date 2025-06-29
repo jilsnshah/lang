@@ -5,17 +5,17 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
-# Your Meta Credentials
-VERIFY_TOKEN = "12345"
-ACCESS_TOKEN = "EAARccu1imkYBO2STiRKXf4dfy4THn8eqzDrpZBHJWcBfWe8egFge6jKpCcchbrbz49nJiDdDDorzWNtbsolZAo6i9Dy2dBJ9gYGCj5A073h2Pu0htDLXC7OotKzCrb5m2Wc2wsHJZC9mTYftVf5nWgM37eK35WvjMZA8vcoVW5105kej127KgR3bDl0GfV1mNUfKjVfwbm8jwoX1vuz9fZA0U8Qe47zg51EUQNtdFjHZBX7ckkkfwbQhUMFyPdaNsZD"  # Your token
-PHONE_NUMBER_ID = "658311557373737"
+# ------------------------------------------------------------------
+# 🔐 Meta Credentials (replace with your actual credentials)
+# ------------------------------------------------------------------
 
-# In-memory user last-message tracker
-# Format: { "wa_id": last_timestamp_in_seconds }
+
+# In-memory tracker for user message times and custom replies
 user_last_message = {}
+custom_reply_text = "Hello! This is a default response."
 
 # ------------------------------------------------------------------
-# 1. Verify Webhook (GET)
+# 1. Webhook Verification (GET)
 # ------------------------------------------------------------------
 @app.route("/webhook", methods=["GET"])
 def verify():
@@ -27,7 +27,7 @@ def verify():
     return "Verification failed", 403
 
 # ------------------------------------------------------------------
-# 2. Receive Messages (POST)
+# 2. Webhook Receiver (POST)
 # ------------------------------------------------------------------
 @app.route("/webhook", methods=["POST"])
 def receive_message():
@@ -41,16 +41,16 @@ def receive_message():
                 messages = value.get("messages", [])
                 for message in messages:
                     sender = message.get("from")
-                    text = message.get("text", {}).get("body")
-                    timestamp = int(message.get("timestamp"))  # Unix seconds
+                    text = message.get("text", {}).get("body", "")
+                    timestamp = int(message.get("timestamp"))
 
                     print(f"📩 Message from {sender}: {text} @ {timestamp}")
 
-                    # Save/update the user's last contact time
+                    # Save last message timestamp
                     user_last_message[sender] = timestamp
 
-                    # ✅ Reply since it's within 24h window
-                    send_whatsapp_message(sender, f"You said: {text}")
+                    # Send the custom reply
+                    send_whatsapp_text(sender, custom_reply_text)
 
     except Exception as e:
         print("❌ Error:", e)
@@ -58,15 +58,27 @@ def receive_message():
     return "EVENT_RECEIVED", 200
 
 # ------------------------------------------------------------------
-# 3. Send Message (Only if within 24-hour window)
+# 3. Endpoint to Set Custom Reply
 # ------------------------------------------------------------------
-def send_whatsapp_message(recipient_number, text):
+@app.route("/set-reply", methods=["POST"])
+def set_reply():
+    global custom_reply_text
+    data = request.get_json()
+    reply = data.get("reply")
+    if reply:
+        custom_reply_text = reply
+        return {"message": "Reply updated successfully."}, 200
+    return {"error": "No reply text provided."}, 400
+
+# ------------------------------------------------------------------
+# 4. Send Text Message (within 24-hour window)
+# ------------------------------------------------------------------
+def send_whatsapp_text(recipient_number, text):
     now = int(time.time())
     last_time = user_last_message.get(recipient_number)
 
-    # Check if user is eligible (within 24h)
     if last_time and (now - last_time) <= 86400:
-        url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
+        url = f"https://graph.facebook.com/v22.0/{PHONE_NUMBER_ID}/messages"
         headers = {
             "Authorization": f"Bearer {ACCESS_TOKEN}",
             "Content-Type": "application/json"
@@ -79,6 +91,7 @@ def send_whatsapp_message(recipient_number, text):
                 "body": text
             }
         }
+
         res = requests.post(url, headers=headers, json=payload)
         print(f"📤 Sent to {recipient_number}: {text}")
         print("✅ Status:", res.status_code)
@@ -86,6 +99,8 @@ def send_whatsapp_message(recipient_number, text):
     else:
         print(f"⏰ Cannot send to {recipient_number} - outside 24h window")
 
+# ------------------------------------------------------------------
+# 5. Run Flask App
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(port=5000, debug=True)
